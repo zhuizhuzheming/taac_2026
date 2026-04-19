@@ -1,5 +1,11 @@
 """
-HyFormer: 最终修复版 - 解决token数量不匹配问题
+HyFormer: Revisiting the Roles of Sequence Modeling and Feature Interaction in CTR Prediction
+论文实现 (WWW 2026 / CIKM 2025)
+
+核心架构:
+- Query Generation: 从NS特征生成Global Query Tokens
+- Query Decoding: Cross-Attention between Global Queries and Sequence KV
+- Query Boosting: MLP-Mixer增强Query与NS-tokens的交互
 """
 
 import torch
