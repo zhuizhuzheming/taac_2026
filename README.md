@@ -421,4 +421,5 @@ Phase 5: 理论深化与问题修复 (2026.04)
 
 特别值得注意的是，这一领域的发展呈现出与LLM领域相似的模式：早期是各种专用架构的百花齐放（DIN/DCN/Wide&Deep），随后是Transformer的引入（AutoInt/HiFormer），接着是Scaling Law的发现与验证（Wukong/RankMixer/LONGER），最终走向统一Backbone（OneTrans/HyFormer/MixFormer/TokenFormer/UniMixer）。TokenFormer对SCP问题的揭示，以及UniMixer对三大范式的理论统一，标志着该领域正从工程实践走向更深层的理论理解。
 
-sandbox:///mnt/agents/output/analysis_overview.png
+<img width="1787" height="1387" alt="image" src="https://github.com/user-attachments/assets/14f8722b-4e31-42a1-993e-0c21b248abc1" />
+
