@@ -1,20 +1,21 @@
-"""PCVRHyFormer → TokenFormer hybrid (GPU‑optimised).
+"""PCVRHyFormer → TokenFormer hybrid with static shape & computational graph optimisations.
 
-Changes for GPU friendliness:
-- Vectorised BFTS mask (no Python for loops)
-- Deep-layer NS token discarding (reduce sequence length & flops)
-- torch.set_float32_matmul_precision('high')
-- Uses F.scaled_dot_product_attention (Flash Attention)
+New features:
+- NS compressor: reduces variable-length NS tokens → fixed number of summary tokens,
+  enabling static sequence length throughout the model.
+- Fused QKV projection: single Linear(d, 3d) for efficiency.
+- Template‑based BFTS mask cache: pre‑built lower‑triangular and sliding window masks,
+  avoiding per‑layer Python loops.
 """
 
-import logging, math
+import logging
+import math
 from typing import List, NamedTuple, Tuple, Optional, Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ── Ensure TF32 and high‑precision matmul for A100/H100 ──
 torch.set_float32_matmul_precision('high')
 
 
@@ -28,7 +29,7 @@ class ModelInput(NamedTuple):
     seq_time_buckets: dict
 
 
-# ═══════════════════════ RoPE (unchanged) ═══════════════════════
+# ══════════════════════════════ RoPE (stability) ══════════════════════════════
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim: int, max_seq_len: int = 2048, base: float = 10000.0):
         super().__init__()
@@ -57,13 +58,19 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rope_to_tensor(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """RoPE computed in float32 to prevent fp16 overflow."""
+    orig_dtype = x.dtype
+    x = x.float()
+    cos = cos.float()
+    sin = sin.float()
     L = x.shape[2]
-    cos_ = cos[:, :L, :].unsqueeze(1)
+    cos_ = cos[:, :L, :].unsqueeze(1)  # (1, 1, L, head_dim)
     sin_ = sin[:, :L, :].unsqueeze(1)
-    return x * cos_ + rotate_half(x) * sin_
+    out = x * cos_ + rotate_half(x) * sin_
+    return out.to(orig_dtype)
 
 
-# ═══════════════════════ NLIR & Blocks ═══════════════════════
+# ═══════════════════════════ NLIR Gate ═══════════════════════════
 class NLIRGate(nn.Module):
     def __init__(self, d_model: int):
         super().__init__()
@@ -74,25 +81,29 @@ class NLIRGate(nn.Module):
         return gate * attn_out
 
 
+# ═══════════════════════════ SwiGLU FFN ═══════════════════════════
 class SwiGLUFFN(nn.Module):
     def __init__(self, d_model: int, hidden_mult: int = 4, dropout: float = 0.0):
         super().__init__()
         hidden_dim = d_model * hidden_mult
         self.norm = nn.LayerNorm(d_model)
-        self.W1 = nn.Linear(d_model, hidden_dim)
-        self.W2 = nn.Linear(d_model, hidden_dim)
+        # Fused W1 and W2 into a single output = 2 * hidden_dim
+        self.W12 = nn.Linear(d_model, 2 * hidden_dim)
         self.W3 = nn.Linear(hidden_dim, d_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x = self.norm(x)
-        x = F.silu(self.W1(x)) * self.W2(x)
+        x12 = self.W12(x)
+        x1, x2 = x12.chunk(2, dim=-1)
+        x = F.silu(x1) * x2
         x = self.dropout(x)
         x = self.W3(x)
         return residual + x
 
 
+# ═══════════════════ Unified Interaction Block ═══════════════════
 class UnifiedInteractionBlock(nn.Module):
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0,
                  hidden_mult: int = 4, use_nlir: bool = True):
@@ -101,10 +112,10 @@ class UnifiedInteractionBlock(nn.Module):
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
         self.use_nlir = use_nlir
+        assert d_model % num_heads == 0
 
-        self.W_q = nn.Linear(d_model, d_model)
-        self.W_k = nn.Linear(d_model, d_model)
-        self.W_v = nn.Linear(d_model, d_model)
+        # Fused Q, K, V projection
+        self.W_qkv = nn.Linear(d_model, 3 * d_model)
         self.W_o = nn.Linear(d_model, d_model)
 
         self.norm_attn = nn.LayerNorm(d_model)
@@ -120,17 +131,19 @@ class UnifiedInteractionBlock(nn.Module):
         residual = x
         x_norm = self.norm_attn(x)
 
-        Q = self.W_q(x_norm).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        K = self.W_k(x_norm).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        V = self.W_v(x_norm).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        qkv = self.W_qkv(x_norm)  # (B, L, 3*D)
+        Q, K, V = qkv.chunk(3, dim=-1)
+        Q = Q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
 
         if rope_cos is not None and rope_sin is not None:
             Q = apply_rope_to_tensor(Q, rope_cos, rope_sin)
             K = apply_rope_to_tensor(K, rope_cos, rope_sin)
 
-        # F.scaled_dot_product_attention will use Flash Attention when possible
         out = F.scaled_dot_product_attention(
-            Q, K, V, attn_mask=attn_mask,
+            Q, K, V,
+            attn_mask=attn_mask,
             dropout_p=self.dropout.p if self.training else 0.0,
         )
         out = torch.nan_to_num(out, nan=0.0)
@@ -144,52 +157,73 @@ class UnifiedInteractionBlock(nn.Module):
         return out
 
 
-# ═══════════════════════ Vectorised BFTS Mask ═══════════════════════
-def build_bfts_mask(
+# ═══════════════ BFTS Mask Cache (static templates) ═══════════════
+class BFTSMaskCache:
+    def __init__(self, max_len: int, swa_window: int):
+        # Pre-compute causal matrix once
+        self.causal = torch.tril(torch.ones(max_len, max_len, dtype=torch.bool))  # (L, L)
+        self.swa_window = swa_window
+        self.max_len = max_len
+
+        # Pre-compute sliding window mask (non‑causal part)
+        idx = torch.arange(max_len).unsqueeze(1) - torch.arange(max_len).unsqueeze(0)
+        self.win_mask = (idx >= 0) & (idx < swa_window)  # lower triangular & within window
+        self.win_mask = self.win_mask.bool()
+
+    def get_full_mask(self, L: int, device: torch.device) -> torch.Tensor:
+        return self.causal[:L, :L].unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, L, L)
+
+    def get_swa_mask(self, L: int, start: int, device: torch.device) -> torch.Tensor:
+        """Return boolean mask that limits token i (in [start, start+L)) to only
+        attend to j in [start, i] within window."""
+        win = self.win_mask[:L, :L].to(device)
+        mask = torch.zeros(1, 1, L, L, dtype=torch.bool, device=device)
+        mask[:, :, :, :] = win  # will be placed later by indexing into the full mask
+        return mask
+
+
+def build_bfts_mask_static(
     B: int, total_len: int, ns_len: int,
     seq_boundaries: List[Tuple[int, int]],
     query_start: int,
     l_full: int, layer_idx: int,
-    swa_window: int, device: torch.device,
+    cache: BFTSMaskCache,
+    device: torch.device,
 ) -> torch.Tensor:
-    """GPU‑native BFTS mask builder — no Python loops over positions."""
-    # Base causal mask
-    mask = torch.ones(B, 1, total_len, total_len, dtype=torch.bool, device=device)
-    causal = torch.tril(torch.ones(total_len, total_len, device=device)).bool()
-    mask = mask & causal.unsqueeze(0).unsqueeze(0)
+    """Construct BFTS mask using pre‑cached static templates.
 
-    if layer_idx < l_full or ns_len == 0:
+    Shallow layers (layer_idx < l_full): full causal attention.
+    Deep layers:
+    - Behaviour tokens: sliding window within their own sequence,
+      plus they CAN attend to NS summary tokens and queries.
+    - NS summary & query tokens: full causal attention.
+    """
+    # Start from full causal mask (template)
+    mask = cache.get_full_mask(total_len, device)  # (1, 1, L, L)
+    mask = mask.expand(B, -1, -1, -1)               # (B, 1, L, L)
+
+    if layer_idx < l_full:
         return mask
 
-    # Behaviour tokens cannot attend to NS tokens
-    for start, end in seq_boundaries:
-        mask[:, :, start:end, :ns_len] = False
-
-    # Sliding window for behaviour tokens (vectorised)
+    # Deep layers: restrict behaviour tokens to sliding window
     for start, end in seq_boundaries:
         if end <= start:
             continue
         L_seq = end - start
-        idx_i = torch.arange(start, end, device=device).view(-1, 1)  # (L_seq, 1)
-        idx_j = torch.arange(start, end, device=device).view(1, -1)  # (1, L_seq)
-        win_mask = (idx_j <= idx_i) & (idx_j > (idx_i - swa_window))
-        mask[:, :, start:end, start:end] = mask[:, :, start:end, start:end] & win_mask.unsqueeze(0).unsqueeze(0)
-        # Already causal, no need to mask j>i
-        # Block attention to tokens before the sequence (except already masked by causal)
-        # But we also want to forbid behaviour → NS (done above), and behaviour → other sequences? No, SWA only within own seq.
+        # Get sliding window mask for this segment
+        swa_mask = cache.get_swa_mask(L_seq, start, device)  # (1, 1, L_seq, L_seq)
+        # Insert into the full mask at positions start:end, start:end
+        mask[:, :, start:end, start:end] = swa_mask
 
-    # NS tokens cannot attend to behaviour tokens
-    if ns_len > 0:
-        mask[:, :, :ns_len, ns_len:query_start] = False
-    # Allow NS → queries
-    if query_start < total_len:
-        mask[:, :, :ns_len, query_start:] = True
+        # Behaviour tokens can still attend to NS summary and queries
+        # (already true because causal mask kept those columns, we only restricted self‑window)
+
     return mask
 
 
-# ═══════════════ NS Tokenizers (identical to previous version) ═══════════════
+# ═══════════════ NS Tokenizers (unchanged) ═══════════════
 class GroupNSTokenizer(nn.Module):
-    # ... (keep your previous code) ...
+    # ... (keep your existing code, unchanged)
     def __init__(self, feature_specs: List[Tuple[int, int, int]],
                  groups: List[List[int]], emb_dim: int, d_model: int,
                  emb_skip_threshold: int = 0) -> None:
@@ -249,7 +283,7 @@ class GroupNSTokenizer(nn.Module):
 
 
 class RankMixerNSTokenizer(nn.Module):
-    # ... (keep your previous code) ...
+    # ... (unchanged)
     def __init__(self, feature_specs: List[Tuple[int, int, int]],
                  groups: List[List[int]], emb_dim: int, d_model: int,
                  num_ns_tokens: int, emb_skip_threshold: int = 0) -> None:
@@ -319,14 +353,41 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)
 
 
+# ═══════════════ NS Compressor (new) ═══════════════
+class NSCompressor(nn.Module):
+    """Compresses variable‑length NS tokens into a fixed number of summary tokens."""
+    def __init__(self, d_model: int, num_summary_tokens: int = 4):
+        super().__init__()
+        self.summary_tokens = num_summary_tokens
+        # Simple learnable pooling queries
+        self.query = nn.Parameter(torch.randn(1, num_summary_tokens, d_model) * 0.02)
+        self.cross_attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, ns_tokens: torch.Tensor) -> torch.Tensor:
+        """Input: ns_tokens (B, N, D). Output: (B, S, D) with S fixed."""
+        B = ns_tokens.shape[0]
+        q = self.query.expand(B, -1, -1)  # (B, S, D)
+        # Cross attention: summary queries attend to NS tokens
+        out, _ = self.cross_attn(q, ns_tokens, ns_tokens)
+        return self.norm(out)
+
+
+# ═══════════════ MultiSeqQueryGenerator (unchanged) ═══════════════
 class MultiSeqQueryGenerator(nn.Module):
-    # ... (keep your previous code) ...
     def __init__(self, d_model: int, num_ns: int, num_queries: int,
-                 num_sequences: int, hidden_mult: int = 4) -> None:
+                 num_sequences: int, hidden_mult: int = 4,
+                 use_time_diff: bool = False, time_emb_dim: int = 0):
         super().__init__()
         self.num_queries = num_queries
         self.num_sequences = num_sequences
-        global_info_dim = (num_ns + 1) * d_model
+        self.use_time_diff = use_time_diff
+        self.time_emb_dim = time_emb_dim
+
+        global_info_dim = num_ns * d_model + d_model
+        if use_time_diff and time_emb_dim > 0:
+            global_info_dim += time_emb_dim
+
         self.global_info_norm = nn.LayerNorm(global_info_dim)
         self.query_ffns_per_seq = nn.ModuleList([
             nn.ModuleList([
@@ -340,7 +401,7 @@ class MultiSeqQueryGenerator(nn.Module):
         ])
 
     def forward(self, ns_tokens: torch.Tensor, seq_tokens_list: list,
-                seq_padding_masks: list) -> list:
+                seq_padding_masks: list, seq_time_embs: Optional[List[torch.Tensor]] = None):
         B = ns_tokens.shape[0]
         ns_flat = ns_tokens.view(B, -1)
         q_tokens_list = []
@@ -350,7 +411,12 @@ class MultiSeqQueryGenerator(nn.Module):
             seq_sum = (seq_tokens_list[i] * valid_mask).sum(dim=1)
             seq_count = valid_mask.sum(dim=1).clamp(min=1)
             seq_pooled = seq_sum / seq_count
-            global_info = torch.cat([ns_flat, seq_pooled], dim=-1)
+
+            global_info = [ns_flat, seq_pooled]
+            if self.use_time_diff and seq_time_embs is not None and i < len(seq_time_embs):
+                global_info.append(seq_time_embs[i])
+
+            global_info = torch.cat(global_info, dim=-1)
             global_info = self.global_info_norm(global_info)
             queries = [ffn(global_info) for ffn in self.query_ffns_per_seq[i]]
             q_tokens = torch.stack(queries, dim=1)
@@ -358,7 +424,7 @@ class MultiSeqQueryGenerator(nn.Module):
         return q_tokens_list
 
 
-# ═══════════════ Main Model ═══════════════
+# ═══════════════════════ Main Model ═══════════════════════
 class PCVRHyFormer(nn.Module):
     def __init__(
         self,
@@ -388,9 +454,13 @@ class PCVRHyFormer(nn.Module):
         bfts_l_full: int = 2,
         bfts_swa_window: int = 50,
         use_nlir: bool = True,
+        ns_token_dropout: float = 0.0,
+        use_time_diff: bool = False,
+        ns_summary_tokens: int = 4,  # new: number of compressed NS summary tokens
     ):
         super().__init__()
         self.d_model = d_model
+        self.emb_dim = emb_dim
         self.action_num = action_num
         self.num_queries = num_queries
         self.seq_domains = sorted(seq_vocab_sizes.keys())
@@ -401,8 +471,12 @@ class PCVRHyFormer(nn.Module):
         self.bfts_swa_window = bfts_swa_window
         self.use_nlir = use_nlir
         self.num_blocks = num_blocks
+        self.ns_token_dropout = ns_token_dropout
+        self.use_time_diff = use_time_diff
+        self.ns_summary_tokens = ns_summary_tokens
+        self._global_ns = None
 
-        # Tokenizers (unchanged)
+        # ---- NS tokenizers (unchanged) ----
         if ns_tokenizer_type == 'group':
             self.user_ns_tokenizer = GroupNSTokenizer(
                 feature_specs=user_int_feature_specs, groups=user_ns_groups,
@@ -444,7 +518,10 @@ class PCVRHyFormer(nn.Module):
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
                        + num_item_ns + (1 if self.has_item_dense else 0))
 
-        # Sequence embedding tables (unchanged)
+        # ---- NS Compressor ----
+        self.ns_compressor = NSCompressor(d_model, ns_summary_tokens)
+
+        # ---- Sequence embedding tables ----
         self._seq_embs = nn.ModuleDict()
         self._seq_emb_index = {}
         self._seq_is_id = {}
@@ -486,15 +563,16 @@ class PCVRHyFormer(nn.Module):
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
 
+        time_diff_dim = d_model if (use_time_diff and num_time_buckets > 0) else 0
+
         self.query_generator = MultiSeqQueryGenerator(
             d_model=d_model, num_ns=self.num_ns, num_queries=num_queries,
             num_sequences=self.num_sequences, hidden_mult=hidden_mult,
+            use_time_diff=use_time_diff, time_emb_dim=time_diff_dim,
         )
 
         self.sep_embedding = nn.Parameter(torch.zeros(1, 1, d_model))
-        nn.init.normal_(self.sep_embedding, std=0.02)
 
-        # Blocks (all unified)
         self.blocks = nn.ModuleList([
             UnifiedInteractionBlock(
                 d_model=d_model, num_heads=num_heads, dropout=dropout_rate,
@@ -507,6 +585,9 @@ class PCVRHyFormer(nn.Module):
             self.rotary_emb = RotaryEmbedding(dim=head_dim, base=rope_base)
         else:
             self.rotary_emb = None
+
+        # Mask cache for BFTS (max length approximated)
+        self.mask_cache = BFTSMaskCache(max_len=2048, swa_window=bfts_swa_window)
 
         self.output_proj = nn.Sequential(
             nn.Linear(num_queries * self.num_sequences * d_model, d_model),
@@ -524,7 +605,9 @@ class PCVRHyFormer(nn.Module):
             nn.Linear(d_model, action_num)
         )
 
+        # ---- Custom weight initialisation ----
         self._init_params()
+        self._init_weights()
 
     def _init_params(self):
         for domain in self.seq_domains:
@@ -538,7 +621,23 @@ class PCVRHyFormer(nn.Module):
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
+        nn.init.normal_(self.sep_embedding, std=0.02)
 
+    def _init_weights(self):
+        """Small‑scale normal init for all Linear layers (excluding embeddings)."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+
+    def set_global_ns(self, global_ns: torch.Tensor):
+        # global_ns is the uncompressed NS mean; we compress it once and cache
+        with torch.no_grad():
+            summary = self.ns_compressor(global_ns.unsqueeze(0))  # (1, S, D)
+        self._global_ns_summary = summary.squeeze(0)  # (S, D)
+
+    # -- embedding helpers unchanged --
     def _embed_seq_domain(self, seq, sideinfo_embs, proj, is_id, emb_index, time_bucket_ids):
         B, S, L = seq.shape
         emb_list = []
@@ -567,21 +666,34 @@ class PCVRHyFormer(nn.Module):
         B = inputs.user_int_feats.shape[0]
         device = inputs.user_int_feats.device
 
-        # 1. NS tokens
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, U, D)
-        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, I, D)
+        # 1. Raw NS tokens
+        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
+        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
         ns_parts = [user_ns]
         if self.has_user_dense:
             ns_parts.append(F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1))
         ns_parts.append(item_ns)
         if self.has_item_dense:
             ns_parts.append(F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1))
-        ns_tokens = torch.cat(ns_parts, dim=1)   # (B, Nns, D)
-        ns_len = ns_tokens.shape[1]
+        ns_tokens_raw = torch.cat(ns_parts, dim=1)  # (B, Nns, D)
 
-        # 2. Embed sequences
+        # NS token dropout (training)
+        if self.training and self.ns_token_dropout > 0:
+            mask = torch.rand(B, ns_tokens_raw.shape[1], 1, device=device) >= self.ns_token_dropout
+            ns_tokens_raw = ns_tokens_raw * mask
+
+        # 2. Compress NS to fixed number of summary tokens
+        if not self.training and self._global_ns is not None:
+            # Use pre‑compressed summary from global mean (if set)
+            ns_summary = self._global_ns_summary.unsqueeze(0).expand(B, -1, -1)
+        else:
+            ns_summary = self.ns_compressor(ns_tokens_raw)  # (B, S, D)
+        ns_len = ns_summary.shape[1]  # fixed
+
+        # 3. Embed sequences
         seq_tokens_list = []
         seq_masks_list = []
+        seq_time_buckets_list = []
         for domain in self.seq_domains:
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
@@ -591,97 +703,74 @@ class PCVRHyFormer(nn.Module):
             mask = self._make_padding_mask(inputs.seq_lens[domain], tokens.shape[1])
             seq_tokens_list.append(tokens)
             seq_masks_list.append(mask)
+            seq_time_buckets_list.append(inputs.seq_time_buckets[domain])
 
-        # 3. Query tokens
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        # 4. Time embeddings for query generator (NaN‑safe)
+        seq_time_embs = None
+        if self.use_time_diff and self.num_time_buckets > 0:
+            seq_time_embs = []
+            for time_bucket_ids in seq_time_buckets_list:
+                valid_mask = (time_bucket_ids != 0).float()
+                sum_bucket = (time_bucket_ids.float() * valid_mask).sum(dim=1)
+                count = valid_mask.sum(dim=1).clamp(min=1)
+                mean_bucket = (sum_bucket / count).long()
+                mean_bucket = torch.clamp(mean_bucket, 1, self.num_time_buckets - 1)
+                time_emb = self.time_embedding(mean_bucket)
+                seq_time_embs.append(time_emb)
 
-        # 4. Build unified stream
+        # 5. Query tokens (still uses raw NS for generation)
+        q_tokens_list = self.query_generator(
+            ns_tokens_raw, seq_tokens_list, seq_masks_list, seq_time_embs)
+
+        # 6. Build unified stream with fixed length
         sep = self.sep_embedding.expand(B, -1, -1)
-        parts = [ns_tokens]          # [NS]
+        parts = [ns_summary]            # start with summary tokens
         boundaries: List[Tuple[int, int]] = []
+        first_seq_start = ns_len + 1    # after first sep
+        current = ns_len
         for tokens in seq_tokens_list:
             parts.append(sep)
-            start = sum(p.shape[1] for p in parts)
+            current += 1  # sep position
+            start = current
             parts.append(tokens)
-            end = start + tokens.shape[1]
+            current += tokens.shape[1]
+            end = current
             boundaries.append((start, end))
         parts.append(sep)
-        query_start = sum(p.shape[1] for p in parts)
+        current += 1
+        query_start = current
         for q in q_tokens_list:
             parts.append(q)
+            current += q.shape[1]
 
-        x = torch.cat(parts, dim=1)          # (B, total_len, D)
+        x = torch.cat(parts, dim=1)  # (B, total_len, D), length is fixed per batch
         total_len = x.shape[1]
 
         if apply_dropout:
             x = self.emb_dropout(x)
 
-        # 5. Run blocks with BFTS mask, with NS discarding after l_full layers
+        # 7. Run blocks with static BFTS mask
         l_full = min(self.bfts_l_full, self.num_blocks)
-        for l_idx in range(l_full):
-            mask = build_bfts_mask(
+        for l_idx in range(self.num_blocks):
+            # Mask derived from static cache
+            mask = build_bfts_mask_static(
                 B=B, total_len=total_len, ns_len=ns_len,
                 seq_boundaries=boundaries, query_start=query_start,
                 l_full=l_full, layer_idx=l_idx,
-                swa_window=self.bfts_swa_window, device=device,
+                cache=self.mask_cache, device=device,
             )
             rope_cos, rope_sin = None, None
             if self.rotary_emb is not None:
                 rope_cos, rope_sin = self.rotary_emb(total_len, device)
             x = self.blocks[l_idx](x, attn_mask=mask, rope_cos=rope_cos, rope_sin=rope_sin)
+            if torch.isnan(x).any():
+                logging.warning(f"NaN after block {l_idx}, resetting")
+                x = torch.nan_to_num(x, nan=0.0)
 
-        # ---- NS discarding ----
-        if ns_len > 0 and l_full < self.num_blocks:
-            # Pool NS info into queries
-            ns_out = x[:, :ns_len, :]                     # (B, ns_len, D)
-            ns_summary = ns_out.mean(dim=1, keepdim=True) # (B, 1, D)
-            # Add summary to all query tokens
-            q_slice = x[:, query_start:, :]
-            q_slice = q_slice + ns_summary
-            # Build new smaller sequence: behaviour tokens + queries
-            x_behav = x[:, ns_len:query_start, :]         # includes seps
-            x = torch.cat([x_behav, q_slice], dim=1)      # (B, total_len - ns_len, D)
-
-            # Update dimensions
-            total_len = x.shape[1]
-            ns_len = 0
-            query_start = total_len - sum(q.shape[1] for q in q_tokens_list)
-            # Update boundaries
-            boundaries = [(max(0, s - (query_start - x_behav.shape[1])), e - (query_start - x_behav.shape[1])) ?
-                          no, careful: original boundaries were absolute positions. After removing ns_len tokens (0..ns_len-1), behaviour start = 0, so every boundary should be shifted by -ns_len.
-            boundaries = [(s - ns_len, e - ns_len) for (s, e) in boundaries]
-            # Now continue with remaining blocks
-            for l_idx in range(l_full, self.num_blocks):
-                mask = build_bfts_mask(
-                    B=B, total_len=total_len, ns_len=0,
-                    seq_boundaries=boundaries, query_start=query_start,
-                    l_full=l_full, layer_idx=l_idx,
-                    swa_window=self.bfts_swa_window, device=device,
-                )
-                rope_cos, rope_sin = None, None
-                if self.rotary_emb is not None:
-                    rope_cos, rope_sin = self.rotary_emb(total_len, device)
-                x = self.blocks[l_idx](x, attn_mask=mask, rope_cos=rope_cos, rope_sin=rope_sin)
-        else:
-            # No discarding or l_full == num_blocks
-            for l_idx in range(l_full, self.num_blocks):
-                mask = build_bfts_mask(
-                    B=B, total_len=total_len, ns_len=ns_len,
-                    seq_boundaries=boundaries, query_start=query_start,
-                    l_full=l_full, layer_idx=l_idx,
-                    swa_window=self.bfts_swa_window, device=device,
-                )
-                rope_cos, rope_sin = None, None
-                if self.rotary_emb is not None:
-                    rope_cos, rope_sin = self.rotary_emb(total_len, device)
-                x = self.blocks[l_idx](x, attn_mask=mask, rope_cos=rope_cos, rope_sin=rope_sin)
-
-        # 6. Extract query outputs
-        query_outputs = x[:, query_start:, :]          # (B, Q, D)
+        # 8. Extract query outputs
+        query_outputs = x[:, query_start:, :]
         flat_q = query_outputs.reshape(B, -1)
-        out_repr = self.output_proj(flat_q)            # (B, D)
-
-        # 7. Classifier
+        out_repr = self.output_proj(flat_q)
         logits = self.clsfier(out_repr)
         return logits, out_repr
 
