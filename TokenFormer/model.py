@@ -1,11 +1,14 @@
-"""PCVRHyFormer → TokenFormer hybrid with static shape & computational graph optimisations.
+"""PCVRHyFormer → TokenFormer hybrid (static shape & computational graph optimised).
 
-New features:
+Includes:
 - NS compressor: reduces variable-length NS tokens → fixed number of summary tokens,
   enabling static sequence length throughout the model.
 - Fused QKV projection: single Linear(d, 3d) for efficiency.
 - Template‑based BFTS mask cache: pre‑built lower‑triangular and sliding window masks,
   avoiding per‑layer Python loops.
+- Float32 RoPE to prevent fp16 overflows.
+- NaN guards.
+- Buffer clone fix to avoid in-place expansion errors.
 """
 
 import logging
@@ -157,7 +160,7 @@ class UnifiedInteractionBlock(nn.Module):
         return out
 
 
-# ═══════════════ BFTS Mask Cache (static templates) ═══════════════
+# ═════════════====== BFTS Mask Cache (static templates) ═══════
 class BFTSMaskCache:
     def __init__(self, max_len: int, swa_window: int):
         # Pre-compute causal matrix once
@@ -175,11 +178,11 @@ class BFTSMaskCache:
 
     def get_swa_mask(self, L: int, start: int, device: torch.device) -> torch.Tensor:
         """Return boolean mask that limits token i (in [start, start+L)) to only
-        attend to j in [start, i] within window."""
+        attend to j in [start, i] within window. Clone to avoid expand issues."""
         win = self.win_mask[:L, :L].to(device)
         mask = torch.zeros(1, 1, L, L, dtype=torch.bool, device=device)
-        mask[:, :, :, :] = win  # will be placed later by indexing into the full mask
-        return mask
+        mask[:, :, :, :] = win
+        return mask.clone()  # crucial for safe assignment
 
 
 def build_bfts_mask_static(
@@ -198,9 +201,9 @@ def build_bfts_mask_static(
       plus they CAN attend to NS summary tokens and queries.
     - NS summary & query tokens: full causal attention.
     """
-    # Start from full causal mask (template)
-    mask = cache.get_full_mask(total_len, device)  # (1, 1, L, L)
-    mask = mask.expand(B, -1, -1, -1)               # (B, 1, L, L)
+    # Start from full causal mask (template), expand and clone to get independent storage
+    base = cache.get_full_mask(total_len, device)  # (1, 1, L, L)
+    mask = base.expand(B, -1, -1, -1).clone()      # (B, 1, L, L)  ← clone fixes expand write error
 
     if layer_idx < l_full:
         return mask
@@ -210,20 +213,16 @@ def build_bfts_mask_static(
         if end <= start:
             continue
         L_seq = end - start
-        # Get sliding window mask for this segment
-        swa_mask = cache.get_swa_mask(L_seq, start, device)  # (1, 1, L_seq, L_seq)
+        # Get sliding window mask for this segment (already cloned)
+        swa = cache.get_swa_mask(L_seq, start, device)  # (1, 1, L_seq, L_seq)
         # Insert into the full mask at positions start:end, start:end
-        mask[:, :, start:end, start:end] = swa_mask
-
-        # Behaviour tokens can still attend to NS summary and queries
-        # (already true because causal mask kept those columns, we only restricted self‑window)
+        mask[:, :, start:end, start:end] = swa
 
     return mask
 
 
 # ═══════════════ NS Tokenizers (unchanged) ═══════════════
 class GroupNSTokenizer(nn.Module):
-    # ... (keep your existing code, unchanged)
     def __init__(self, feature_specs: List[Tuple[int, int, int]],
                  groups: List[List[int]], emb_dim: int, d_model: int,
                  emb_skip_threshold: int = 0) -> None:
@@ -283,7 +282,6 @@ class GroupNSTokenizer(nn.Module):
 
 
 class RankMixerNSTokenizer(nn.Module):
-    # ... (unchanged)
     def __init__(self, feature_specs: List[Tuple[int, int, int]],
                  groups: List[List[int]], emb_dim: int, d_model: int,
                  num_ns_tokens: int, emb_skip_threshold: int = 0) -> None:
@@ -353,7 +351,7 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)
 
 
-# ═══════════════ NS Compressor (new) ═══════════════
+# ═══════════════ NS Compressor ═══════════════
 class NSCompressor(nn.Module):
     """Compresses variable‑length NS tokens into a fixed number of summary tokens."""
     def __init__(self, d_model: int, num_summary_tokens: int = 4):
@@ -373,7 +371,7 @@ class NSCompressor(nn.Module):
         return self.norm(out)
 
 
-# ═══════════════ MultiSeqQueryGenerator (unchanged) ═══════════════
+# ═══════════════ MultiSeqQueryGenerator ═══════════════
 class MultiSeqQueryGenerator(nn.Module):
     def __init__(self, d_model: int, num_ns: int, num_queries: int,
                  num_sequences: int, hidden_mult: int = 4,
@@ -456,7 +454,7 @@ class PCVRHyFormer(nn.Module):
         use_nlir: bool = True,
         ns_token_dropout: float = 0.0,
         use_time_diff: bool = False,
-        ns_summary_tokens: int = 4,  # new: number of compressed NS summary tokens
+        ns_summary_tokens: int = 4,
     ):
         super().__init__()
         self.d_model = d_model
@@ -476,7 +474,7 @@ class PCVRHyFormer(nn.Module):
         self.ns_summary_tokens = ns_summary_tokens
         self._global_ns = None
 
-        # ---- NS tokenizers (unchanged) ----
+        # ---- NS tokenizers ----
         if ns_tokenizer_type == 'group':
             self.user_ns_tokenizer = GroupNSTokenizer(
                 feature_specs=user_int_feature_specs, groups=user_ns_groups,
@@ -726,7 +724,6 @@ class PCVRHyFormer(nn.Module):
         sep = self.sep_embedding.expand(B, -1, -1)
         parts = [ns_summary]            # start with summary tokens
         boundaries: List[Tuple[int, int]] = []
-        first_seq_start = ns_len + 1    # after first sep
         current = ns_len
         for tokens in seq_tokens_list:
             parts.append(sep)
