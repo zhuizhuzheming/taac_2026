@@ -1,15 +1,6 @@
-"""PCVRHyFormer → TokenFormer hybrid (static shape & computational graph optimised).
+# ==================== model.py (TokenFormer DEFUSE 完整版) ====================
 
-Includes:
-- NS compressor: reduces variable-length NS tokens → fixed number of summary tokens,
-  enabling static sequence length throughout the model.
-- Fused QKV projection: single Linear(d, 3d) for efficiency.
-- Template‑based BFTS mask cache: pre‑built lower‑triangular and sliding window masks,
-  avoiding per‑layer Python loops.
-- Float32 RoPE to prevent fp16 overflows.
-- NaN guards.
-- Buffer clone fix to avoid in-place expansion errors.
-"""
+"""PCVRTokenFormer with Action-Aware Embedding and Multi-Task Output."""
 
 import logging
 import math
@@ -30,9 +21,12 @@ class ModelInput(NamedTuple):
     seq_data: dict
     seq_lens: dict
     seq_time_buckets: dict
+    seq_time_decay: Optional[dict] = None
+    user_id: Optional[List[str]] = None
+    action_type: Optional[torch.Tensor] = None  # 【新增】[B] 0=曝光,1=点击,2=转化
 
 
-# ══════════════════════════════ RoPE (stability) ══════════════════════════════
+# ── RoPE (unchanged) ──
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim: int, max_seq_len: int = 2048, base: float = 10000.0):
         super().__init__()
@@ -61,19 +55,18 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rope_to_tensor(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """RoPE computed in float32 to prevent fp16 overflow."""
     orig_dtype = x.dtype
     x = x.float()
     cos = cos.float()
     sin = sin.float()
     L = x.shape[2]
-    cos_ = cos[:, :L, :].unsqueeze(1)  # (1, 1, L, head_dim)
+    cos_ = cos[:, :L, :].unsqueeze(1)
     sin_ = sin[:, :L, :].unsqueeze(1)
     out = x * cos_ + rotate_half(x) * sin_
     return out.to(orig_dtype)
 
 
-# ═══════════════════════════ NLIR Gate ═══════════════════════════
+# ── NLIR Gate (unchanged) ──
 class NLIRGate(nn.Module):
     def __init__(self, d_model: int):
         super().__init__()
@@ -84,13 +77,12 @@ class NLIRGate(nn.Module):
         return gate * attn_out
 
 
-# ═══════════════════════════ SwiGLU FFN ═══════════════════════════
+# ── SwiGLU FFN (unchanged) ──
 class SwiGLUFFN(nn.Module):
     def __init__(self, d_model: int, hidden_mult: int = 4, dropout: float = 0.0):
         super().__init__()
         hidden_dim = d_model * hidden_mult
         self.norm = nn.LayerNorm(d_model)
-        # Fused W1 and W2 into a single output = 2 * hidden_dim
         self.W12 = nn.Linear(d_model, 2 * hidden_dim)
         self.W3 = nn.Linear(hidden_dim, d_model)
         self.dropout = nn.Dropout(dropout)
@@ -106,7 +98,7 @@ class SwiGLUFFN(nn.Module):
         return residual + x
 
 
-# ═══════════════════ Unified Interaction Block ═══════════════════
+# ── Unified Interaction Block (unchanged) ──
 class UnifiedInteractionBlock(nn.Module):
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0,
                  hidden_mult: int = 4, use_nlir: bool = True):
@@ -117,7 +109,6 @@ class UnifiedInteractionBlock(nn.Module):
         self.use_nlir = use_nlir
         assert d_model % num_heads == 0
 
-        # Fused Q, K, V projection
         self.W_qkv = nn.Linear(d_model, 3 * d_model)
         self.W_o = nn.Linear(d_model, d_model)
 
@@ -134,7 +125,7 @@ class UnifiedInteractionBlock(nn.Module):
         residual = x
         x_norm = self.norm_attn(x)
 
-        qkv = self.W_qkv(x_norm)  # (B, L, 3*D)
+        qkv = self.W_qkv(x_norm)
         Q, K, V = qkv.chunk(3, dim=-1)
         Q = Q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         K = K.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
@@ -160,68 +151,42 @@ class UnifiedInteractionBlock(nn.Module):
         return out
 
 
-# ═════════════====== BFTS Mask Cache (static templates) ═══════
-class BFTSMaskCache:
-    def __init__(self, max_len: int, swa_window: int):
-        # Pre-compute causal matrix once
-        self.causal = torch.tril(torch.ones(max_len, max_len, dtype=torch.bool))  # (L, L)
-        self.swa_window = swa_window
-        self.max_len = max_len
+# ── CrossDomainQueryInteraction (unchanged) ──
+class CrossDomainQueryInteraction(nn.Module):
+    def __init__(self, d_model: int, num_sequences: int, num_queries: int, num_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.num_sequences = num_sequences
+        self.num_queries = num_queries
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        self.fusion = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model * 2, d_model),
+                nn.LayerNorm(d_model),
+                nn.Dropout(dropout),
+                nn.SiLU(),
+            ) for _ in range(num_sequences)
+        ])
+        self.cross_attn = nn.ModuleList([
+            nn.MultiheadAttention(d_model, num_heads, batch_first=True, dropout=dropout)
+            for _ in range(num_sequences)
+        ])
+        self.norm = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(num_sequences)])
 
-        # Pre-compute sliding window mask (non‑causal part)
-        idx = torch.arange(max_len).unsqueeze(1) - torch.arange(max_len).unsqueeze(0)
-        self.win_mask = (idx >= 0) & (idx < swa_window)  # lower triangular & within window
-        self.win_mask = self.win_mask.bool()
-
-    def get_full_mask(self, L: int, device: torch.device) -> torch.Tensor:
-        return self.causal[:L, :L].unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, L, L)
-
-    def get_swa_mask(self, L: int, start: int, device: torch.device) -> torch.Tensor:
-        """Return boolean mask that limits token i (in [start, start+L)) to only
-        attend to j in [start, i] within window. Clone to avoid expand issues."""
-        win = self.win_mask[:L, :L].to(device)
-        mask = torch.zeros(1, 1, L, L, dtype=torch.bool, device=device)
-        mask[:, :, :, :] = win
-        return mask.clone()  # crucial for safe assignment
-
-
-def build_bfts_mask_static(
-    B: int, total_len: int, ns_len: int,
-    seq_boundaries: List[Tuple[int, int]],
-    query_start: int,
-    l_full: int, layer_idx: int,
-    cache: BFTSMaskCache,
-    device: torch.device,
-) -> torch.Tensor:
-    """Construct BFTS mask using pre‑cached static templates.
-
-    Shallow layers (layer_idx < l_full): full causal attention.
-    Deep layers:
-    - Behaviour tokens: sliding window within their own sequence,
-      plus they CAN attend to NS summary tokens and queries.
-    - NS summary & query tokens: full causal attention.
-    """
-    # Start from full causal mask (template), expand and clone to get independent storage
-    base = cache.get_full_mask(total_len, device)  # (1, 1, L, L)
-    mask = base.expand(B, -1, -1, -1).clone()      # (B, 1, L, L)  ← clone fixes expand write error
-
-    if layer_idx < l_full:
-        return mask
-
-    # Deep layers: restrict behaviour tokens to sliding window
-    for start, end in seq_boundaries:
-        if end <= start:
-            continue
-        L_seq = end - start
-        # Get sliding window mask for this segment (already cloned)
-        swa = cache.get_swa_mask(L_seq, start, device)  # (1, 1, L_seq, L_seq)
-        # Insert into the full mask at positions start:end, start:end
-        mask[:, :, start:end, start:end] = swa
-
-    return mask
+    def forward(self, q_tokens_list: List[torch.Tensor]) -> List[torch.Tensor]:
+        q_all = torch.cat(q_tokens_list, dim=1)
+        global_q = self.global_pool(q_all.transpose(1, 2)).transpose(1, 2)
+        
+        result = []
+        for i, q_domain in enumerate(q_tokens_list):
+            attn_out, _ = self.cross_attn[i](q_domain, global_q, global_q)
+            attn_out = self.norm[i](q_domain + attn_out)
+            fused = self.fusion[i](torch.cat([q_domain, global_q.expand(-1, q_domain.shape[1], -1)], dim=-1))
+            result.append(fused + attn_out)
+        
+        return result
 
 
-# ═══════════════ NS Tokenizers (unchanged) ═══════════════
+# ── NS Tokenizers (unchanged) ──
 class GroupNSTokenizer(nn.Module):
     def __init__(self, feature_specs: List[Tuple[int, int, int]],
                  groups: List[List[int]], emb_dim: int, d_model: int,
@@ -351,46 +316,56 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)
 
 
-# ═══════════════ NS Compressor ═══════════════
+# ── NS Compressor (unchanged) ──
 class NSCompressor(nn.Module):
-    """Compresses variable‑length NS tokens into a fixed number of summary tokens."""
     def __init__(self, d_model: int, num_summary_tokens: int = 4):
         super().__init__()
         self.summary_tokens = num_summary_tokens
-        # Simple learnable pooling queries
         self.query = nn.Parameter(torch.randn(1, num_summary_tokens, d_model) * 0.02)
         self.cross_attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, ns_tokens: torch.Tensor) -> torch.Tensor:
-        """Input: ns_tokens (B, N, D). Output: (B, S, D) with S fixed."""
         B = ns_tokens.shape[0]
-        q = self.query.expand(B, -1, -1)  # (B, S, D)
-        # Cross attention: summary queries attend to NS tokens
+        q = self.query.expand(B, -1, -1)
         out, _ = self.cross_attn(q, ns_tokens, ns_tokens)
         return self.norm(out)
 
 
-# ═══════════════ MultiSeqQueryGenerator ═══════════════
+# ── MultiSeqQueryGenerator (unchanged) ──
 class MultiSeqQueryGenerator(nn.Module):
-    def __init__(self, d_model: int, num_ns: int, num_queries: int,
-                 num_sequences: int, hidden_mult: int = 4,
-                 use_time_diff: bool = False, time_emb_dim: int = 0):
+    def __init__(
+        self,
+        d_model: int, num_ns: int, num_queries: int,
+        num_sequences: int, hidden_mult: int = 4,
+        use_time_diff: bool = False, time_emb_dim: int = 0,
+        use_time_decay: bool = False):
         super().__init__()
         self.num_queries = num_queries
         self.num_sequences = num_sequences
         self.use_time_diff = use_time_diff
         self.time_emb_dim = time_emb_dim
+        self.use_time_decay = use_time_decay
 
-        global_info_dim = num_ns * d_model + d_model
-        if use_time_diff and time_emb_dim > 0:
-            global_info_dim += time_emb_dim
-
-        self.global_info_norm = nn.LayerNorm(global_info_dim)
+        self.ns_flat_dim = num_ns * d_model
+        self.seq_pool_dim = d_model
+        self.base_input_dim = self.ns_flat_dim + self.seq_pool_dim
+        self.has_time_diff = use_time_diff and time_emb_dim > 0
+        
+        self.input_proj = nn.Linear(self.base_input_dim, d_model)
+        
+        if self.has_time_diff:
+            self.time_diff_proj = nn.Linear(time_emb_dim, d_model // 2)
+            self.fusion_proj = nn.Linear(d_model + d_model // 2, d_model)
+        else:
+            self.fusion_proj = None
+        
+        self.global_info_norm = nn.LayerNorm(d_model)
+        
         self.query_ffns_per_seq = nn.ModuleList([
             nn.ModuleList([
                 nn.Sequential(
-                    nn.Linear(global_info_dim, d_model * hidden_mult),
+                    nn.Linear(d_model, d_model * hidden_mult),
                     nn.SiLU(),
                     nn.Linear(d_model * hidden_mult, d_model),
                     nn.LayerNorm(d_model),
@@ -399,31 +374,62 @@ class MultiSeqQueryGenerator(nn.Module):
         ])
 
     def forward(self, ns_tokens: torch.Tensor, seq_tokens_list: list,
-                seq_padding_masks: list, seq_time_embs: Optional[List[torch.Tensor]] = None):
+                seq_padding_masks: list, 
+                seq_time_embs: Optional[List[torch.Tensor]] = None,
+                seq_time_decay: Optional[List[torch.Tensor]] = None):
         B = ns_tokens.shape[0]
         ns_flat = ns_tokens.view(B, -1)
         q_tokens_list = []
+        
         for i in range(self.num_sequences):
             mask = ~seq_padding_masks[i]
             valid_mask = mask.unsqueeze(-1).float()
+            
             seq_sum = (seq_tokens_list[i] * valid_mask).sum(dim=1)
             seq_count = valid_mask.sum(dim=1).clamp(min=1)
             seq_pooled = seq_sum / seq_count
 
-            global_info = [ns_flat, seq_pooled]
-            if self.use_time_diff and seq_time_embs is not None and i < len(seq_time_embs):
-                global_info.append(seq_time_embs[i])
+            if self.use_time_decay and seq_time_decay is not None and i < len(seq_time_decay):
+                decay = seq_time_decay[i].unsqueeze(-1)
+                weighted_sum = (seq_tokens_list[i] * decay * valid_mask).sum(dim=1)
+                weight_sum = (decay * valid_mask).sum(dim=1).clamp(min=1)
+                seq_pooled = weighted_sum / weight_sum
 
-            global_info = torch.cat(global_info, dim=-1)
+            global_info = torch.cat([ns_flat, seq_pooled], dim=-1)
+            global_info = self.input_proj(global_info)
+            
+            if self.has_time_diff and seq_time_embs is not None and i < len(seq_time_embs):
+                time_feat = self.time_diff_proj(seq_time_embs[i])
+                global_info = self.fusion_proj(torch.cat([global_info, time_feat], dim=-1))
+            
             global_info = self.global_info_norm(global_info)
+            
             queries = [ffn(global_info) for ffn in self.query_ffns_per_seq[i]]
             q_tokens = torch.stack(queries, dim=1)
             q_tokens_list.append(q_tokens)
+        
         return q_tokens_list
 
 
-# ═══════════════════════ Main Model ═══════════════════════
-class PCVRHyFormer(nn.Module):
+# ── Adaptive SWA Config (unchanged) ──
+class AdaptiveSWAConfig:
+    def __init__(self, default_window: int = 50):
+        self.default_window = default_window
+        self.domain_windows: Dict[str, int] = {}
+
+    def set_window(self, domain: str, max_len: int, ratio: float = 0.2):
+        window = max(int(max_len * ratio), self.default_window)
+        self.domain_windows[domain] = window
+        return window
+
+    def get_window(self, domain: str) -> int:
+        return self.domain_windows.get(domain, self.default_window)
+
+
+# ═══════════════════════════════════════════════════════
+# Main Model - TokenFormer DEFUSE Edition
+# ═══════════════════════════════════════════════════════
+class PCVRTokenFormer(nn.Module):
     def __init__(
         self,
         user_int_feature_specs: List[Tuple[int, int, int]],
@@ -433,16 +439,16 @@ class PCVRHyFormer(nn.Module):
         seq_vocab_sizes: Dict[str, List[int]],
         user_ns_groups: List[List[int]],
         item_ns_groups: List[List[int]],
-        d_model: int = 64,
-        emb_dim: int = 64,
-        num_queries: int = 1,
-        num_blocks: int = 4,
+        d_model: int = 128,           # 【修改】64→128
+        emb_dim: int = 128,           # 【修改】64→128
+        num_queries: int = 4,         # 【修改】1→4
+        num_blocks: int = 3,          # 【修改】4→3
         num_heads: int = 4,
         hidden_mult: int = 4,
-        dropout_rate: float = 0.01,
+        dropout_rate: float = 0.1,    # 【修改】0.01→0.1
         action_num: int = 1,
         num_time_buckets: int = 65,
-        use_rope: bool = False,
+        use_rope: bool = True,        # 【修改】False→True
         rope_base: float = 10000.0,
         emb_skip_threshold: int = 0,
         seq_id_threshold: int = 10000,
@@ -452,9 +458,17 @@ class PCVRHyFormer(nn.Module):
         bfts_l_full: int = 2,
         bfts_swa_window: int = 50,
         use_nlir: bool = True,
-        ns_token_dropout: float = 0.0,
+        ns_token_dropout: float = 0.1,  # 【修改】0.0→0.1
         use_time_diff: bool = False,
+        use_time_decay: bool = True,    # 【修改】默认开启
         ns_summary_tokens: int = 4,
+        cache_ns_during_training: bool = False,
+        ns_cache_size: int = 10000,
+        seq_max_lens: Optional[Dict[str, int]] = None,
+        use_cross_domain: bool = False,  # 【修改】默认关闭，简化
+        predict_conversion_time: bool = False,
+        multi_task: bool = False,        # 【新增】多任务开关
+        num_action_types: int = 3,
     ):
         super().__init__()
         self.d_model = d_model
@@ -466,15 +480,26 @@ class PCVRHyFormer(nn.Module):
         self.num_time_buckets = num_time_buckets
         self.use_rope = use_rope
         self.bfts_l_full = bfts_l_full
-        self.bfts_swa_window = bfts_swa_window
         self.use_nlir = use_nlir
         self.num_blocks = num_blocks
         self.ns_token_dropout = ns_token_dropout
         self.use_time_diff = use_time_diff
+        self.use_time_decay = use_time_decay
         self.ns_summary_tokens = ns_summary_tokens
+        self.cache_ns_during_training = cache_ns_during_training
+        self.predict_conversion_time = predict_conversion_time
+        self.multi_task = multi_task      # 【新增】
         self._global_ns = None
 
-        # ---- NS tokenizers ----
+        # Adaptive SWA
+        self.swa_config = AdaptiveSWAConfig(default_window=bfts_swa_window)
+        if seq_max_lens is not None:
+            for domain in self.seq_domains:
+                max_len = seq_max_lens.get(domain, 256)
+                self.swa_config.set_window(domain, max_len, ratio=0.2)
+            logging.info(f"Adaptive SWA: {self.swa_config.domain_windows}")
+
+        # NS tokenizers
         if ns_tokenizer_type == 'group':
             self.user_ns_tokenizer = GroupNSTokenizer(
                 feature_specs=user_int_feature_specs, groups=user_ns_groups,
@@ -516,10 +541,21 @@ class PCVRHyFormer(nn.Module):
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
                        + num_item_ns + (1 if self.has_item_dense else 0))
 
-        # ---- NS Compressor ----
         self.ns_compressor = NSCompressor(d_model, ns_summary_tokens)
 
-        # ---- Sequence embedding tables ----
+        if cache_ns_during_training:
+            self.register_buffer('_ns_cache_keys', torch.full((ns_cache_size,), -1, dtype=torch.long))
+            self.register_buffer('_ns_cache_values', torch.zeros(ns_cache_size, ns_summary_tokens, d_model))
+            self._ns_cache_ptr = 0
+            self._ns_cache_hits = 0
+            self._ns_cache_misses = 0
+
+        # 【新增】Action Type Embedding
+        self.action_emb = nn.Embedding(num_action_types, emb_dim, padding_idx=0)  # 0=曝光,1=点击,2=转化
+        nn.init.xavier_normal_(self.action_emb.weight.data)
+        self.action_emb.weight.data[0, :] = 0
+
+        # Sequence embeddings
         self._seq_embs = nn.ModuleDict()
         self._seq_emb_index = {}
         self._seq_is_id = {}
@@ -563,11 +599,26 @@ class PCVRHyFormer(nn.Module):
 
         time_diff_dim = d_model if (use_time_diff and num_time_buckets > 0) else 0
 
+        if use_time_decay:
+            self.time_decay_proj = nn.Sequential(
+                nn.Linear(1, d_model // 2),
+                nn.SiLU(),
+                nn.Linear(d_model // 2, d_model),
+            )
+
         self.query_generator = MultiSeqQueryGenerator(
-            d_model=d_model, num_ns=self.num_ns, num_queries=num_queries,
+            d_model=self.d_model, num_ns=self.num_ns, num_queries=num_queries,
             num_sequences=self.num_sequences, hidden_mult=hidden_mult,
             use_time_diff=use_time_diff, time_emb_dim=time_diff_dim,
+            use_time_decay=use_time_decay,
         )
+
+        self.use_cross_domain = use_cross_domain
+        if use_cross_domain:
+            self.cross_domain_interaction = CrossDomainQueryInteraction(
+                d_model=d_model, num_sequences=self.num_sequences, 
+                num_queries=num_queries, num_heads=num_heads, dropout=dropout_rate
+            )
 
         self.sep_embedding = nn.Parameter(torch.zeros(1, 1, d_model))
 
@@ -584,8 +635,10 @@ class PCVRHyFormer(nn.Module):
         else:
             self.rotary_emb = None
 
-        # Mask cache for BFTS (max length approximated)
-        self.mask_cache = BFTSMaskCache(max_len=2048, swa_window=bfts_swa_window)
+        # Static masks
+        self._has_static_masks = False
+        if seq_max_lens is not None:
+            self._register_static_masks(seq_max_lens, num_blocks)
 
         self.output_proj = nn.Sequential(
             nn.Linear(num_queries * self.num_sequences * d_model, d_model),
@@ -595,6 +648,7 @@ class PCVRHyFormer(nn.Module):
         self.emb_dropout = nn.Dropout(dropout_rate)
         self.seq_id_emb_dropout = nn.Dropout(dropout_rate * 2)
 
+        # 【修改】分类器：支持多任务
         self.clsfier = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.LayerNorm(d_model),
@@ -602,10 +656,84 @@ class PCVRHyFormer(nn.Module):
             nn.Dropout(dropout_rate),
             nn.Linear(d_model, action_num)
         )
+        
+        # 【新增】多任务输出头
+        if multi_task:
+            self.cvr_head = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.LayerNorm(d_model // 2),
+                nn.SiLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(d_model // 2, 1)
+            )
+            self.ctr_head = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.LayerNorm(d_model // 2),
+                nn.SiLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(d_model // 2, 1)
+            )
+            self.ctcvr_head = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.LayerNorm(d_model // 2),
+                nn.SiLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(d_model // 2, 1)
+            )
+        
+        if predict_conversion_time:
+            self.time_predictor = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.LayerNorm(d_model // 2),
+                nn.SiLU(),
+                nn.Linear(d_model // 2, 1)
+            )
 
-        # ---- Custom weight initialisation ----
         self._init_params()
         self._init_weights()
+
+    def _register_static_masks(self, seq_max_lens: Dict[str, int], num_layers: int):
+        ns_len = self.ns_summary_tokens
+        total_len = ns_len
+        boundaries = []
+        
+        for domain in self.seq_domains:
+            max_len = seq_max_lens.get(domain, 256)
+            start = total_len + 1
+            end = start + max_len
+            boundaries.append((start, end))
+            total_len = end + 1
+        
+        total_len += 1
+        query_start = total_len
+        for _ in self.seq_domains:
+            total_len += self.num_queries
+        
+        l_full = min(self.bfts_l_full, num_layers)
+        
+        for l_idx in range(num_layers):
+            mask = torch.tril(torch.ones(total_len, total_len, dtype=torch.bool))
+            
+            if l_idx >= l_full:
+                for domain_idx, (start, end) in enumerate(boundaries):
+                    if end <= start:
+                        continue
+                    domain = self.seq_domains[domain_idx]
+                    L_seq = end - start
+                    window = self.swa_config.get_window(domain)
+                    
+                    idx = torch.arange(L_seq)
+                    win_mask = (idx.unsqueeze(1) - idx.unsqueeze(0) >= 0) & \
+                               (idx.unsqueeze(1) - idx.unsqueeze(0) < window)
+                    mask[start:end, start:end] = win_mask
+            
+            self.register_buffer(f'_static_mask_l{l_idx}', mask, persistent=False)
+        
+        self._has_static_masks = True
+        self._static_total_len = total_len
+        self._static_query_start = query_start
+        self._static_ns_len = ns_len
+        self._static_boundaries = boundaries
 
     def _init_params(self):
         for domain in self.seq_domains:
@@ -622,7 +750,6 @@ class PCVRHyFormer(nn.Module):
         nn.init.normal_(self.sep_embedding, std=0.02)
 
     def _init_weights(self):
-        """Small‑scale normal init for all Linear layers (excluding embeddings)."""
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -630,13 +757,52 @@ class PCVRHyFormer(nn.Module):
                     nn.init.constant_(module.bias, 0.0)
 
     def set_global_ns(self, global_ns: torch.Tensor):
-        # global_ns is the uncompressed NS mean; we compress it once and cache
         with torch.no_grad():
-            summary = self.ns_compressor(global_ns.unsqueeze(0))  # (1, S, D)
-        self._global_ns_summary = summary.squeeze(0)  # (S, D)
+            summary = self.ns_compressor(global_ns.unsqueeze(0))
+        self._global_ns_summary = summary.squeeze(0)
 
-    # -- embedding helpers unchanged --
-    def _embed_seq_domain(self, seq, sideinfo_embs, proj, is_id, emb_index, time_bucket_ids):
+    def _get_cached_ns(self, user_ids, ns_tokens_raw):
+        if not hasattr(self, '_ns_cache_keys'):
+            return self.ns_compressor(ns_tokens_raw)
+        B = len(user_ids)
+        device = ns_tokens_raw.device
+        result = torch.zeros(B, self.ns_summary_tokens, self.d_model, device=device)
+        need_compute_idx = []
+        need_compute_cache_pos = []
+        
+        for i, uid in enumerate(user_ids):
+            if uid is None:
+                need_compute_idx.append(i)
+                need_compute_cache_pos.append(-1)
+                continue
+            cache_idx = hash(str(uid)) % self._ns_cache_keys.shape[0]
+            cached_key = self._ns_cache_keys[cache_idx].item()
+            if cached_key == hash(str(uid)):
+                result[i] = self._ns_cache_values[cache_idx].to(device)
+                self._ns_cache_hits += 1
+            else:
+                need_compute_idx.append(i)
+                need_compute_cache_pos.append(cache_idx)
+                self._ns_cache_misses += 1
+        
+        if need_compute_idx:
+            computed = self.ns_compressor(ns_tokens_raw[need_compute_idx])
+            result[need_compute_idx] = computed
+            for idx, cache_pos in zip(need_compute_idx, need_compute_cache_pos):
+                if cache_pos >= 0:
+                    self._ns_cache_keys[cache_pos] = hash(str(user_ids[idx]))
+                    self._ns_cache_values[cache_pos] = computed[idx].detach().cpu()
+        
+        return result
+
+    # 【核心修改】_embed_seq_domain 增加 action_types 参数
+    def _embed_seq_domain(self, seq, sideinfo_embs, proj, is_id, emb_index, 
+                         time_bucket_ids, time_decay=None, action_types=None):
+        """
+        【修改】增加 action_types 参数，注入行为类型信号
+        
+        action_types: [B] — 每个样本的行为类型（0/1/2）
+        """
         B, S, L = seq.shape
         emb_list = []
         for i in range(S):
@@ -649,10 +815,40 @@ class PCVRHyFormer(nn.Module):
                 if is_id[i] and self.training:
                     e = self.seq_id_emb_dropout(e)
                 emb_list.append(e)
+        
+        # 基础 item embedding
         cat_emb = torch.cat(emb_list, dim=-1)
-        token_emb = F.gelu(proj(cat_emb))
+        token_emb = F.gelu(proj(cat_emb))  # [B, L, d_model]
+        
+        # 【核心新增】Action Type Gating
+        if action_types is not None and hasattr(self, 'action_emb'):
+            # action_types: [B] → [B, 1] → [B, L]
+            action_types_expanded = action_types.unsqueeze(1).expand(-1, L)  # [B, L]
+            
+            # 查询 action embedding: [B, L] → [B, L, emb_dim]
+            action_emb = self.action_emb(action_types_expanded)
+            
+            # 轻量投影到 d_model 维度（如果 emb_dim != d_model）
+            if action_emb.shape[-1] != token_emb.shape[-1]:
+                action_proj = nn.Linear(action_emb.shape[-1], token_emb.shape[-1], device=action_emb.device)
+                action_emb = action_proj(action_emb)
+            
+            # 门控融合：action_emb 调制 token_emb
+            # 点击(1)和转化(2)增强，曝光(0)中性
+            gate = torch.sigmoid(action_emb.mean(dim=-1, keepdim=True))  # [B, L, 1]
+            # 中心化：gate 从 [0,1] 映射到 [0.5, 1.5] 的调制范围
+            modulation = 1.0 + 0.3 * (gate - 0.5)  # 点击/转化增强 ~1.15，曝光抑制 ~0.85
+            token_emb = token_emb * modulation
+        
+        # Time Bucket
         if self.num_time_buckets > 0:
             token_emb = token_emb + self.time_embedding(time_bucket_ids)
+        
+        # Time Decay
+        if time_decay is not None and hasattr(self, 'time_decay_proj'):
+            decay_emb = self.time_decay_proj(time_decay.unsqueeze(-1))
+            token_emb = token_emb + decay_emb
+        
         return token_emb
 
     def _make_padding_mask(self, seq_len, max_len):
@@ -673,37 +869,52 @@ class PCVRHyFormer(nn.Module):
         ns_parts.append(item_ns)
         if self.has_item_dense:
             ns_parts.append(F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1))
-        ns_tokens_raw = torch.cat(ns_parts, dim=1)  # (B, Nns, D)
+        ns_tokens_raw = torch.cat(ns_parts, dim=1)
 
-        # NS token dropout (training)
         if self.training and self.ns_token_dropout > 0:
             mask = torch.rand(B, ns_tokens_raw.shape[1], 1, device=device) >= self.ns_token_dropout
             ns_tokens_raw = ns_tokens_raw * mask
 
-        # 2. Compress NS to fixed number of summary tokens
-        if not self.training and self._global_ns is not None:
-            # Use pre‑compressed summary from global mean (if set)
+        # 2. NS Compression
+        if self.training and self.cache_ns_during_training and inputs.user_id is not None:
+            ns_summary = self._get_cached_ns(inputs.user_id, ns_tokens_raw)
+        elif not self.training and self._global_ns is not None:
             ns_summary = self._global_ns_summary.unsqueeze(0).expand(B, -1, -1)
         else:
-            ns_summary = self.ns_compressor(ns_tokens_raw)  # (B, S, D)
-        ns_len = ns_summary.shape[1]  # fixed
+            ns_summary = self.ns_compressor(ns_tokens_raw)
+        ns_len = ns_summary.shape[1]
 
-        # 3. Embed sequences
+        # 3. Embed sequences —— 【修改】传入 action_type
         seq_tokens_list = []
         seq_masks_list = []
         seq_time_buckets_list = []
+        seq_time_decay_list = []
+        
+        # 获取 action_type（可能为 None）
+        action_types = getattr(inputs, 'action_type', None)
+        
         for domain in self.seq_domains:
+            time_decay = None
+            if self.use_time_decay and inputs.seq_time_decay is not None:
+                time_decay = inputs.seq_time_decay.get(domain, None)
+            
+            # 【修改】传入 action_types
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                time_decay=time_decay,
+                action_types=action_types)
+            
             mask = self._make_padding_mask(inputs.seq_lens[domain], tokens.shape[1])
             seq_tokens_list.append(tokens)
             seq_masks_list.append(mask)
             seq_time_buckets_list.append(inputs.seq_time_buckets[domain])
+            if time_decay is not None:
+                seq_time_decay_list.append(time_decay)
 
-        # 4. Time embeddings for query generator (NaN‑safe)
+        # 4. Time embeddings
         seq_time_embs = None
         if self.use_time_diff and self.num_time_buckets > 0:
             seq_time_embs = []
@@ -716,18 +927,24 @@ class PCVRHyFormer(nn.Module):
                 time_emb = self.time_embedding(mean_bucket)
                 seq_time_embs.append(time_emb)
 
-        # 5. Query tokens (still uses raw NS for generation)
+        # 5. Query tokens
         q_tokens_list = self.query_generator(
-            ns_tokens_raw, seq_tokens_list, seq_masks_list, seq_time_embs)
+            ns_tokens_raw, seq_tokens_list, seq_masks_list, 
+            seq_time_embs=seq_time_embs,
+            seq_time_decay=seq_time_decay_list if self.use_time_decay else None)
 
-        # 6. Build unified stream with fixed length
+        # Cross-domain interaction
+        if self.use_cross_domain:
+            q_tokens_list = self.cross_domain_interaction(q_tokens_list)
+
+        # 6. Build unified stream
         sep = self.sep_embedding.expand(B, -1, -1)
-        parts = [ns_summary]            # start with summary tokens
-        boundaries: List[Tuple[int, int]] = []
+        parts = [ns_summary]
+        boundaries = []
         current = ns_len
         for tokens in seq_tokens_list:
             parts.append(sep)
-            current += 1  # sep position
+            current += 1
             start = current
             parts.append(tokens)
             current += tokens.shape[1]
@@ -740,44 +957,89 @@ class PCVRHyFormer(nn.Module):
             parts.append(q)
             current += q.shape[1]
 
-        x = torch.cat(parts, dim=1)  # (B, total_len, D), length is fixed per batch
+        x = torch.cat(parts, dim=1)
         total_len = x.shape[1]
 
         if apply_dropout:
             x = self.emb_dropout(x)
 
-        # 7. Run blocks with static BFTS mask
+        # 7. Run blocks with static masks
         l_full = min(self.bfts_l_full, self.num_blocks)
-        for l_idx in range(self.num_blocks):
-            # Mask derived from static cache
-            mask = build_bfts_mask_static(
-                B=B, total_len=total_len, ns_len=ns_len,
-                seq_boundaries=boundaries, query_start=query_start,
-                l_full=l_full, layer_idx=l_idx,
-                cache=self.mask_cache, device=device,
-            )
-            rope_cos, rope_sin = None, None
-            if self.rotary_emb is not None:
-                rope_cos, rope_sin = self.rotary_emb(total_len, device)
-            x = self.blocks[l_idx](x, attn_mask=mask, rope_cos=rope_cos, rope_sin=rope_sin)
-            if torch.isnan(x).any():
-                logging.warning(f"NaN after block {l_idx}, resetting")
-                x = torch.nan_to_num(x, nan=0.0)
+        
+        if self._has_static_masks and total_len == self._static_total_len:
+            for l_idx in range(self.num_blocks):
+                mask = getattr(self, f'_static_mask_l{l_idx}')
+                mask = mask.unsqueeze(0).unsqueeze(0).expand(B, -1, -1, -1)
+                rope_cos, rope_sin = None, None
+                if self.rotary_emb is not None:
+                    rope_cos, rope_sin = self.rotary_emb(total_len, device)
+                x = self.blocks[l_idx](x, attn_mask=mask, rope_cos=rope_cos, rope_sin=rope_sin)
+                if torch.isnan(x).any():
+                    logging.warning(f"NaN after block {l_idx}, resetting")
+                    x = torch.nan_to_num(x, nan=0.0)
+        else:
+            for l_idx in range(self.num_blocks):
+                mask = torch.tril(torch.ones(total_len, total_len, dtype=torch.bool, device=device))
+                mask = mask.unsqueeze(0).unsqueeze(0).expand(B, -1, -1, -1).clone()
+                if l_idx >= l_full:
+                    for domain_idx, (start, end) in enumerate(boundaries):
+                        if end <= start: 
+                            continue
+                        domain = self.seq_domains[domain_idx]
+                        L_seq = end - start
+                        window = self.swa_config.get_window(domain)
+                        
+                        idx = torch.arange(L_seq, device=device)
+                        win_mask = (idx.unsqueeze(1) - idx.unsqueeze(0) >= 0) & \
+                                   (idx.unsqueeze(1) - idx.unsqueeze(0) < window)
+                        mask[:, :, start:end, start:end] = win_mask.unsqueeze(0).unsqueeze(0)
+                rope_cos, rope_sin = None, None
+                if self.rotary_emb is not None:
+                    rope_cos, rope_sin = self.rotary_emb(total_len, device)
+                x = self.blocks[l_idx](x, attn_mask=mask, rope_cos=rope_cos, rope_sin=rope_sin)
 
-        # 8. Extract query outputs
+        # 8. Extract outputs
         query_outputs = x[:, query_start:, :]
         flat_q = query_outputs.reshape(B, -1)
         out_repr = self.output_proj(flat_q)
+        
+        # 【修改】多任务输出
+        if self.multi_task:
+            cvr_logit = self.cvr_head(out_repr)
+            ctr_logit = self.ctr_head(out_repr)
+            ctcvr_logit = self.ctcvr_head(out_repr)
+            return cvr_logit, ctr_logit, ctcvr_logit, out_repr
+        
         logits = self.clsfier(out_repr)
-        return logits, out_repr
+        
+        time_pred = None
+        if self.predict_conversion_time and hasattr(self, 'time_predictor'):
+            time_pred = self.time_predictor(out_repr).squeeze(-1)
+        
+        return logits, out_repr, time_pred
 
-    def forward(self, inputs: ModelInput) -> torch.Tensor:
-        logits, _ = self._forward_impl(inputs, apply_dropout=self.training)
+    # 【修改】forward 支持多任务
+    def forward(self, inputs: ModelInput):
+        if self.multi_task:
+            cvr_logit, ctr_logit, ctcvr_logit, out_repr = self._forward_impl(inputs, apply_dropout=self.training)
+            if self.predict_conversion_time and self.training:
+                time_pred = self.time_predictor(out_repr).squeeze(-1) if hasattr(self, 'time_predictor') else None
+                return cvr_logit, ctr_logit, ctcvr_logit, time_pred
+            return cvr_logit, ctr_logit, ctcvr_logit
+        
+        logits, _, time_pred = self._forward_impl(inputs, apply_dropout=self.training)
+        if self.predict_conversion_time and self.training:
+            return logits, time_pred
         return logits
 
+    # 【修改】predict 支持多任务
     def predict(self, inputs: ModelInput):
         with torch.no_grad():
-            logits, out_repr = self._forward_impl(inputs, apply_dropout=False)
+            if self.multi_task:
+                cvr_logit, ctr_logit, ctcvr_logit, out_repr = self._forward_impl(inputs, apply_dropout=False)
+                return cvr_logit, ctr_logit, ctcvr_logit, out_repr
+            
+            logits, out_repr, _ = self._forward_impl(inputs, apply_dropout=False)
         return logits, out_repr
 
     def get_sparse_params(self):
@@ -796,7 +1058,8 @@ class PCVRHyFormer(nn.Module):
         for domain in self.seq_domains:
             for i, vs in enumerate(self._seq_vocab_sizes[domain]):
                 real_idx = self._seq_emb_index[domain][i]
-                if real_idx == -1: continue
+                if real_idx == -1: 
+                    continue
                 if int(vs) > threshold:
                     emb = self._seq_embs[domain][real_idx]
                     nn.init.xavier_normal_(emb.weight.data)
@@ -805,7 +1068,8 @@ class PCVRHyFormer(nn.Module):
         for tokenizer in [self.user_ns_tokenizer, self.item_ns_tokenizer]:
             for i, (vs, offset, length) in enumerate(tokenizer.feature_specs):
                 real_idx = tokenizer._emb_index[i]
-                if real_idx == -1: continue
+                if real_idx == -1: 
+                    continue
                 if int(vs) > threshold:
                     emb = tokenizer.embs[real_idx]
                     nn.init.xavier_normal_(emb.weight.data)
