@@ -20,19 +20,20 @@ import math
 
 
 class AdaptiveFocalLoss(nn.Module):
-    """Preserved from v5.2 with gamma_min=0.5 fix."""
     def __init__(
         self,
-        alpha: float = 0.1,
-        max_gamma: float = 2.0,
-        gamma_lr: float = 0.01,
+        alpha_pos: float = 0.5,
+        alpha_neg: float = 0.5,
+        max_gamma: float = 4.0,
+        gamma_lr: float = 0.05,
         gamma_clip: float = 5.0,
-        gamma_warmup_steps: int = 1000,  # FIXED: 3000->1000, faster warmup for TAAC
-        gamma_min: float = 1.0,  # FIXED: 0.5->1.0, stronger focal from start
+        gamma_warmup_steps: int = 1000,
+        gamma_min: float = 0.5,
         gamma_reg_coef: float = 0.05,
     ):
         super().__init__()
-        self.alpha = alpha
+        self.alpha_pos = alpha_pos
+        self.alpha_neg = alpha_neg
         self.max_gamma = max_gamma
         self.gamma_lr = gamma_lr
         self.gamma_clip = gamma_clip
@@ -40,7 +41,7 @@ class AdaptiveFocalLoss(nn.Module):
         self.gamma_min = gamma_min
         self.gamma_reg_coef = gamma_reg_coef
 
-        self.gamma_logit = nn.Parameter(torch.tensor(0.0))  # sigmoid(0)=0.5
+        self.gamma_logit = nn.Parameter(torch.tensor(0.0))
         self.gamma_optimizer = torch.optim.Adam([self.gamma_logit], lr=gamma_lr)
         self._gamma_history = []
         self._step_count = 0
@@ -64,7 +65,7 @@ class AdaptiveFocalLoss(nn.Module):
         focal_weight = (1 - p_t) ** gamma
         focal_weight = torch.clamp(focal_weight, max=10.0)
         
-        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        alpha_t = targets * self.alpha_pos + (1 - targets) * self.alpha_neg
         focal_loss = (alpha_t * focal_weight * bce_loss).mean()
 
         gamma_reg = self.gamma_reg_coef * torch.abs(gamma - self.gamma_min) / (self.max_gamma - self.gamma_min + 1e-8)
@@ -183,6 +184,48 @@ class GraftedOptimizer:
         self.step_count = state_dict.get('step_count', 0)
 
 
+def calibration_loss(logits: torch.Tensor, targets: torch.Tensor, n_bins: int = 10) -> torch.Tensor:
+    """Soft Expected Calibration Error (ECE)"""
+    with torch.no_grad():
+        probs = torch.sigmoid(logits.detach())
+        bin_boundaries = torch.linspace(0, 1, n_bins + 1, device=logits.device)
+        bin_ids = torch.bucketize(probs, bin_boundaries) - 1
+        bin_ids = bin_ids.clamp(0, n_bins - 1)
+        bin_sums = torch.zeros(n_bins, device=logits.device)
+        bin_counts = torch.zeros(n_bins, device=logits.device)
+        bin_true = torch.zeros(n_bins, device=logits.device)
+        for i in range(n_bins):
+            mask = (bin_ids == i)
+            bin_counts[i] = mask.sum()
+            if bin_counts[i] > 0:
+                bin_sums[i] = probs[mask].sum()
+                bin_true[i] = targets[mask].sum()
+    valid = bin_counts > 10
+    if valid.sum() > 0:
+        avg_pred = bin_sums[valid] / bin_counts[valid]
+        avg_true = bin_true[valid] / bin_counts[valid]
+        weights = bin_counts[valid] / bin_counts[valid].sum()
+        ece = (torch.abs(avg_pred - avg_true) * weights).sum()
+        return ece
+    else:
+        return torch.tensor(0.0, device=logits.device)
+
+
+def lambdarank_loss(logits: torch.Tensor, targets: torch.Tensor, n_pairs: int = 100) -> torch.Tensor:
+    """Pairwise hinge loss for AUC optimization."""
+    pos_mask = targets == 1
+    neg_mask = targets == 0
+    pos_idx = torch.where(pos_mask)[0]
+    neg_idx = torch.where(neg_mask)[0]
+    if len(pos_idx) == 0 or len(neg_idx) == 0:
+        return torch.tensor(0.0, device=logits.device)
+    n = min(n_pairs, len(pos_idx) * len(neg_idx))
+    p_idx = pos_idx[torch.randint(0, len(pos_idx), (n,), device=logits.device)]
+    n_idx = neg_idx[torch.randint(0, len(neg_idx), (n,), device=logits.device)]
+    diff = logits[p_idx] - logits[n_idx]
+    loss = F.softplus(-diff).mean()
+    return loss
+
 class PCVRHeteroFormerTrainer:
     def __init__(
         self,
@@ -218,6 +261,15 @@ class PCVRHeteroFormerTrainer:
         label_smoothing_min_eps: float = 0.001,
         label_smoothing_anneal_steps: int = 5000,
         gse_aux_weight: float = 0.5,  # NEW: GSE auxiliary loss weight
+        # 新增不对称 focal 参数
+        focal_alpha_pos: float = 0.5,
+        focal_alpha_neg: float = 0.5,
+        focal_max_gamma: float = 4.0,
+        # 新增先验权重、校准权重、lambda权重
+        prior_weight: float = 0.001,
+        ece_weight: float = 0.05,
+        lambdarank_weight: float = 0.1,
+        global_ctr: float = 0.01,
     ) -> None:
         self.model = model
         self.train_loader = train_loader
@@ -239,19 +291,10 @@ class PCVRHeteroFormerTrainer:
         self.label_smoothing_min_eps = label_smoothing_min_eps
         self.label_smoothing_anneal_steps = label_smoothing_anneal_steps
         self.pos_rate_ema = 0.01
-
-        if use_adaptive_focal and loss_type == 'focal':
-            self.adaptive_focal = AdaptiveFocalLoss(
-                alpha=focal_alpha, max_gamma=focal_gamma, gamma_lr=0.05,  # FIXED v4: 0.01->0.05, faster gamma adaptation
-                gamma_warmup_steps=1000, gamma_min=1.0, gamma_reg_coef=0.05,  # FIXED for TAAC2026
-            )
-            self.focal_alpha = focal_alpha
-            self.focal_gamma = focal_gamma
-            logging.info(f"v7.1 AdaptiveFocalLoss: max_gamma={focal_gamma}, alpha={focal_alpha}, gamma_min=0.5")
-        else:
-            self.adaptive_focal = None
-            self.focal_alpha = focal_alpha
-            self.focal_gamma = focal_gamma
+        self.prior_weight = prior_weight
+        self.ece_weight = ece_weight
+        self.lambdarank_weight = lambdarank_weight
+        self.global_ctr = global_ctr
 
         if hasattr(model, 'get_sparse_params') and use_grafted_optimizer:
             sparse_params = model.get_sparse_params()
@@ -267,7 +310,7 @@ class PCVRHeteroFormerTrainer:
             ]
             dense_opt = torch.optim.AdamW(dense_param_groups, lr=lr, betas=(0.9, 0.98))
             gate_opt = torch.optim.AdamW(gate_params, lr=lr*2, betas=(0.9, 0.98), weight_decay=1e-3) if gate_params else None
-            self.optimizer = GraftedOptimizer(sparse_opt, dense_opt, gate_opt, target_ratio=1.0)
+            self.optimizer = GraftedOptimizer(sparse_opt, dense_opt, gate_opt, target_ratio=1.0,adapt_interval=1000000)
             self.sparse_optimizer = None
             self.dense_optimizer = None
         elif hasattr(model, 'get_sparse_params'):
@@ -298,12 +341,39 @@ class PCVRHeteroFormerTrainer:
         self._emb_grad_history: Dict[int, list] = {}
         self._emb_death_threshold = 500
 
+        self.use_lambda_rank = (lambdarank_weight > 0.99)
+        self.lambda_n_pairs = 500               # 增加 pair 数
+        self.bce_aux_weight = 0.4              # 弱 BCE 辅助权重
+
+        # LambdaRank 模式下不需要 AdaptiveFocalLoss，避免额外参数和干扰
+        if use_adaptive_focal and loss_type == 'focal' and not self.use_lambda_rank:
+            self.adaptive_focal = AdaptiveFocalLoss(
+                alpha_pos=focal_alpha_pos,
+                alpha_neg=focal_alpha_neg,
+                max_gamma=focal_max_gamma,
+                gamma_lr=0.05,
+                gamma_warmup_steps=1000,
+                gamma_min=0.5,
+                gamma_reg_coef=0.05,
+            )
+            self.focal_alpha = focal_alpha
+            self.focal_gamma = focal_gamma
+            logging.info(  
+                f"v7.1-fix AdaptiveFocalLoss: max_gamma={focal_max_gamma}, "
+                f"alpha_pos={focal_alpha_pos}, alpha_neg={focal_alpha_neg}, gamma_min=0.5"
+                )
+        else:
+            self.adaptive_focal = None
+            self.focal_alpha = focal_alpha
+            self.focal_gamma = focal_gamma
+
         if warmup_steps > 0:
             logging.info(f"Warmup: {warmup_steps} steps")
 
     def _smooth_labels(self, labels: torch.Tensor) -> torch.Tensor:
         if self.label_smoothing_strategy == 'none':
-            return labels
+            eps = self.label_smoothing_max_eps
+            return labels * (1 - 2 * eps) + eps
 
         if self.use_adaptive_focal and self.adaptive_focal is not None:
             gamma = self.adaptive_focal.get_gamma().item()
@@ -437,60 +507,97 @@ class PCVRHeteroFormerTrainer:
                     )
 
     def _train_step(self, batch: Dict[str, Any]) -> float:
+        torch.autograd.set_detect_anomaly(True)
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
-        label = self._smooth_labels(label)
 
+        # LambdaRank 使用原始 0/1 标签，不进行平滑
+        if not self.use_lambda_rank:
+            label = self._smooth_labels(label)
+
+        # 梯度清零
         if self.optimizer is not None:
             self.optimizer.zero_grad()
         else:
             self.dense_optimizer.zero_grad()
             if self.sparse_optimizer is not None:
                 self.sparse_optimizer.zero_grad()
-        if self.adaptive_focal is not None:
+        # 仅在 Focal Loss 模式下才需要清除 gamma_optimizer 的梯度
+        if not self.use_lambda_rank and self.adaptive_focal is not None:
             self.adaptive_focal.gamma_optimizer.zero_grad()
 
         model_input = self._make_model_input(device_batch)
         logits = self.model(model_input).squeeze(-1)
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            logging.warning(f"NaN/Inf in logits at step {self.global_step}, skipping entire batch")
+            if self.optimizer is not None:
+                self.optimizer.zero_grad()
+            else:
+                self.dense_optimizer.zero_grad()
+                if self.sparse_optimizer is not None:
+                    self.sparse_optimizer.zero_grad()
+            return float('nan')
 
-        # === Main Loss ===
-        if self.adaptive_focal is not None:
-            loss = self.adaptive_focal(logits, label)
-        elif self.loss_type == 'focal':
-            p = torch.sigmoid(logits)
-            p = torch.clamp(p, min=1e-7, max=1-1e-7)
-            bce_loss = F.binary_cross_entropy_with_logits(logits, label, reduction='none')
-            p_t = p * label + (1 - p) * (1 - label)
-            focal_weight = (1 - p_t) ** self.focal_gamma
-            focal_weight = torch.clamp(focal_weight, max=10.0)
-            alpha_t = self.focal_alpha * label + (1 - self.focal_alpha) * (1 - label)
-            loss = (alpha_t * focal_weight * bce_loss).mean()
+        # ================================================================
+        # 主损失：LambdaRank (AUC 优化) + 弱 BCE 辅助 或 Focal Loss
+        # ================================================================
+        if self.use_lambda_rank:
+            # 核心排序损失
+            loss = lambdarank_loss(logits, label, n_pairs=self.lambda_n_pairs)
+            # 微弱的 BCE 辅助，仅用于提供稳定的 logits 基线，防止均值漂移
+            bce_aux = F.binary_cross_entropy_with_logits(logits, label, reduction='mean')
+            loss = loss + self.bce_aux_weight * bce_aux
         else:
-            loss = F.binary_cross_entropy_with_logits(logits, label)
+            if self.adaptive_focal is not None:
+                loss = self.adaptive_focal(logits, label)
+            elif self.loss_type == 'focal':
+                p = torch.sigmoid(logits)
+                p = torch.clamp(p, min=1e-7, max=1-1e-7)
+                bce_loss = F.binary_cross_entropy_with_logits(logits, label, reduction='none')
+                p_t = p * label + (1 - p) * (1 - label)
+                focal_weight = (1 - p_t) ** self.focal_gamma
+                focal_weight = torch.clamp(focal_weight, max=10.0)
+                alpha_t = self.focal_alpha * label + (1 - self.focal_alpha) * (1 - label)
+                loss = (alpha_t * focal_weight * bce_loss).mean()
+            else:
+                loss = F.binary_cross_entropy_with_logits(logits, label)
 
-        # === GSE Auxiliary Loss (architecture-preserving: collected after forward) ===
+        # ================================================================
+        # GSE 辅助损失 (大幅降权，仅作微弱正则)
+        # ================================================================
         gse_aux_loss = torch.tensor(0.0, device=self.device)
         if hasattr(self.model, 'get_aux_loss'):
             gse_aux_loss = self.model.get_aux_loss()
-        
-        # Decay aux weight over time (anneal to 0.1)
-        aux_weight = max(0.001, self.gse_aux_weight * math.exp(-self.global_step / 2000.0))  # FIXED: epoch-proportional decay, 2epochs->0.01
+        aux_weight = max(0.001, self.gse_aux_weight * math.exp(-self.global_step / 2000.0))
+        # LambdaRank 模式下进一步降低 GSE 权重，避免干扰排序目标
+        if self.use_lambda_rank:
+            aux_weight *= 0.1
         loss = loss + aux_weight * gse_aux_loss
 
-        # === Alignment penalty ===
-        if hasattr(self.model, '_alignment_penalty'):
-            loss = loss + 0.1 * self.model._alignment_penalty
-
-        # === ZMLC ===
-        zmlc_loss = torch.tensor(0.0, device=self.device)
-        if hasattr(self.model, 'use_zmlc') and self.model.use_zmlc:
-            zmlc_lambda = getattr(self.model, 'zmlc_lambda', 0.05)
-            zmlc_loss = zmlc_lambda * (logits.mean() ** 2)
-            loss = loss + zmlc_loss
-
-        # === NaN/Inf Guard ===
+        # ================================================================
+        # NaN/Inf 防护
+        # ================================================================
         if torch.isnan(loss) or torch.isinf(loss):
             logging.warning(f"NaN/Inf loss at step {self.global_step}, skipping batch")
+            if self.optimizer is not None:
+                self.optimizer.zero_grad()
+            else:
+                self.dense_optimizer.zero_grad()
+                if self.sparse_optimizer is not None:
+                    self.sparse_optimizer.zero_grad()
+            return float('nan')
+
+        if torch.isnan(loss).any() or torch.isinf(loss).any():
+            main_loss = loss.item()
+            gse_val = gse_aux_loss.item() if isinstance(gse_aux_loss, torch.Tensor) else gse_aux_loss
+            detail = [f"total={main_loss:.4f}", f"gse_aux={gse_val:.4f}"]
+            with torch.no_grad():
+                logits_min = logits.min().item()
+                logits_max = logits.max().item()
+                logits_mean = logits.mean().item()
+                logits_std = logits.std().item()
+                detail.append(f"logits(min={logits_min:.2f},max={logits_max:.2f},mean={logits_mean:.2f},std={logits_std:.2f})")
+            logging.warning(f"NaN/Inf loss detected before backward at step {self.global_step}, skipping. Details: " + " | ".join(detail))
             if self.optimizer is not None:
                 self.optimizer.zero_grad()
             else:
@@ -531,8 +638,7 @@ class PCVRHeteroFormerTrainer:
             return float('nan')
 
         # === Gradient Clipping ===
-        # FIXED: 软梯度约束 - 仅裁剪norm，不逐元素限幅，保留梯度方向信息
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5, foreach=False)
 
         self.global_step += 1
         if self.warmup_steps > 0 and self.global_step <= self.warmup_steps:
@@ -561,22 +667,30 @@ class PCVRHeteroFormerTrainer:
             if self.sparse_optimizer is not None:
                 self.sparse_optimizer.step()
 
-        if self.adaptive_focal is not None:
+        # NaN 参数检查
+        has_nan_param = any(
+            torch.isnan(p).any() or torch.isinf(p).any()
+            for p in self.model.parameters()
+        )
+        if has_nan_param:
+            logging.error(f"NaN/Inf parameter detected after optimizer step {self.global_step}! Training broken.")
+
+        # 仅在非 LambdaRank 模式下更新可学习的 focal gamma
+        if not self.use_lambda_rank and self.adaptive_focal is not None:
             self.adaptive_focal.step()
 
-        # === Logging (preserved pattern + GSE extensions) ===
+        # === Logging ===
         if self.global_step % 500 == 0:
             log_parts = [f"[Step {self.global_step}] loss={loss.item():.4f}"]
+            log_parts.append(f"gse_aux={gse_aux_loss.item():.4f}")
             with torch.no_grad():
                 logits_mean = logits.mean()
                 logits_std = logits.std()
                 log_parts.append(f"logits_mean={logits_mean.item():.3f}")
                 log_parts.append(f"logits_std={logits_std.item():.3f}")
-                # FIXED: 监控std与目标的偏离
                 std_target = 0.8
                 std_dev = abs(logits_std.item() - std_target)
                 log_parts.append(f"std_dev={std_dev:.3f}(target={std_target})")
-                # FIXED: 添加训练集AUC监控（TAAC2026核心指标）
                 try:
                     from sklearn.metrics import roc_auc_score
                     probs = torch.sigmoid(logits).cpu().numpy()
@@ -585,21 +699,16 @@ class PCVRHeteroFormerTrainer:
                     log_parts.append(f"train_AUC={train_auc:.4f}")
                 except Exception:
                     pass
-                # FIXED: log output_scale for debugging
                 if hasattr(self.model, 'output_scale_logit'):
                     scale = torch.sigmoid(self.model.output_scale_logit).item() * 2.0
                     log_parts.append(f"out_scale={scale:.3f}")
-                if hasattr(self.model, 'use_zmlc') and self.model.use_zmlc:
-                    log_parts.append(f"zmlc_loss={zmlc_loss.item():.4f}")
                 log_parts.append(f"emb_grad_norm={total_emb_grad_norm:.3f}")
-                log_parts.append(f"gse_aux={gse_aux_loss.item():.4f}")
                 log_parts.append(f"aux_w={aux_weight:.3f}")
-            if self.adaptive_focal is not None:
+            if not self.use_lambda_rank and self.adaptive_focal is not None:
                 g = self.adaptive_focal.get_gamma().item()
                 log_parts.append(f"gamma={g:.3f}")
             if opt_diag:
                 log_parts.append(f"sparse/dense_ratio={opt_diag.get('grad_norm_ratio', 0):.2f}")
-            # GSE diagnostics via model.get_diagnostics()
             if hasattr(self.model, 'get_diagnostics'):
                 d = self.model.get_diagnostics()
                 for k, v in d.items():
@@ -612,14 +721,10 @@ class PCVRHeteroFormerTrainer:
             self.writer.add_scalar('Loss/train', loss.item(), self.global_step)
             self.writer.add_scalar('Diagnostics/logits_mean', logits.mean().item(), self.global_step)
             self.writer.add_scalar('Diagnostics/logits_std', logits.std().item(), self.global_step)
-            if hasattr(self.model, 'use_zmlc') and self.model.use_zmlc:
-                self.writer.add_scalar('Diagnostics/zmlc_loss', zmlc_loss.item(), self.global_step)
             self.writer.add_scalar('GSE/aux_loss', gse_aux_loss.item(), self.global_step)
             self.writer.add_scalar('GSE/aux_weight', aux_weight, self.global_step)
-            # NOTE: 仅记录验证AUC，训练AUC无意义
-            if self.adaptive_focal is not None:
+            if not self.use_lambda_rank and self.adaptive_focal is not None:
                 self.writer.add_scalar('Focal/gamma', self.adaptive_focal.get_gamma().item(), self.global_step)
-            # Per-domain GSE diagnostics
             if hasattr(self.model, 'get_diagnostics'):
                 d = self.model.get_diagnostics()
                 for k, v in d.items():

@@ -233,7 +233,7 @@ class PCVRParquetDataset(IterableDataset):
         for fid, dim in self._user_dense_cols:
             self.user_dense_schema.add(fid, dim)
 
-        self.item_dense_schema: FeatureSchema = FeatureSchema()
+        self.item_dense_schema = FeatureSchema()
 
         self._seq_cfg: Dict[str, Dict[str, Any]] = raw['seq']
         self.seq_domains: List[str] = sorted(self._seq_cfg.keys())
@@ -319,6 +319,16 @@ class PCVRParquetDataset(IterableDataset):
                 idx = slice(i, end)
             batch: Dict[str, Any] = {k: v[idx] for k, v in merged.items()}
             batch.update(non_tensor_keys)
+            if self.is_training and batch['label'].sum() == 0:
+                continue   # 跳过全负 batch，让 LambdaRank 至少有一个正样本
+            skip = False
+            for domain in batch['_seq_domains']:
+                lengths = batch[f'{domain}_len']
+                if (lengths == 0).all():
+                    skip = True
+                    break
+            if skip:
+                continue
             yield batch
         del merged, rand_idx
         buffer.clear()

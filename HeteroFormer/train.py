@@ -1,4 +1,4 @@
-"""HeteroFormer training entry point for TAAC2026 — v7.1 Architecture-Preserving GSE Edition."""
+"""HeteroFormer training entry point for TAAC2026 — v7.1-fix."""
 
 import os
 import json
@@ -110,30 +110,34 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument('--shrinkage', type=float, default=0.05)
 
-    parser.add_argument('--zmlc_lambda', type=float, default=0.05,
+    parser.add_argument('--zmlc_lambda', type=float, default=0.05,   # FIX: 0.15 -> 0.05
                         help='Zero-Mean Logit Constraint lambda.')
     parser.add_argument('--cross_network_layers', type=int, default=2,
                         help='DCN-v2 style cross network layers. 0 to disable.')
 
-    # === v7.1: GSE Parameters (new, transparent to architecture) ===
     parser.add_argument('--gse_num_codes', type=int, default=64,
-                        help='VQ codebook size per sequence domain (excluding null code)')
+                        help='VQ codebook size per sequence domain')
     parser.add_argument('--gse_code_dim', type=int, default=64,
                         help='Dimension of each VQ code')
     parser.add_argument('--gse_num_layers', type=int, default=4,
                         help='Number of transformer layers inside GSE')
-    parser.add_argument('--gse_aux_weight', type=float, default=0.5,
-                        help='Weight for GSE auxiliary losses (annealed to 0.1)')
+    parser.add_argument('--gse_aux_weight', type=float, default=0.3,  # FIX: 0.5 -> 0.3
+                        help='Weight for GSE auxiliary losses')
 
-    # === torch.compile 控制参数 ===
     parser.add_argument('--compile_backend', type=str, default='aot_eager',
-                        help='torch.compile backend: aot_eager, inductor, eager, etc.')
+                        help='torch.compile backend')
     parser.add_argument('--compile_mode', type=str, default='',
-                        help='torch.compile mode (e.g. reduce-overhead, default). If set, overwrites backend.')
-    parser.add_argument('--compile_dynamic', action='store_true', default=True,
-                        help='Enable dynamic shapes for compile (default: True)')
-    parser.add_argument('--compile_suppress_errors', action='store_true', default=True,
-                        help='Suppress compile errors and fall back to eager (default: True)')
+                        help='torch.compile mode')
+    parser.add_argument('--compile_dynamic', action='store_true', default=True)
+    parser.add_argument('--compile_suppress_errors', action='store_true', default=True)
+
+    parser.add_argument('--focal_alpha_pos', type=float, default=0.6)
+    parser.add_argument('--focal_alpha_neg', type=float, default=0.4)
+    parser.add_argument('--focal_max_gamma', type=float, default=4.0)
+    parser.add_argument('--prior_weight', type=float, default=0.001)
+    parser.add_argument('--ece_weight', type=float, default=0.05)
+    parser.add_argument('--lambdarank_weight', type=float, default=0.1)
+    parser.add_argument('--global_ctr', type=float, default=0.01)
 
     args = parser.parse_args()
 
@@ -201,7 +205,6 @@ def main() -> None:
     item_int_feature_specs = build_feature_specs(
         pcvr_dataset.item_int_schema, pcvr_dataset.item_int_vocab_sizes)
 
-    # === Model construction: preserved pattern, GSE params passed transparently ===
     model_args = {
         "user_int_feature_specs": user_int_feature_specs,
         "item_int_feature_specs": item_int_feature_specs,
@@ -239,7 +242,6 @@ def main() -> None:
         "cross_network_layers": args.cross_network_layers,
         "use_zmlc": args.zmlc_lambda > 0.0,
         "zmlc_lambda": args.zmlc_lambda,
-        # GSE params: transparent pass-through
         "gse_num_codes": args.gse_num_codes,
         "gse_code_dim": args.gse_code_dim,
         "gse_num_layers": args.gse_num_layers,
@@ -247,8 +249,6 @@ def main() -> None:
 
     model = PCVRHeteroFormer(**model_args).to(args.device)
 
-    # === torch.compile: safer configuration ===
-    # === torch.compile: 按命令行参数配置 ===
     if args.compile_suppress_errors:
         import torch._dynamo
         torch._dynamo.config.suppress_errors = True
@@ -256,13 +256,15 @@ def main() -> None:
 
     if args.device == 'cuda' and hasattr(torch, 'compile'):
         try:
-            compile_kwargs = {"fullgraph": False}
+            compile_kwargs = {
+                "fullgraph": False,      # 不使用全图编译，降低优化激进程度
+                "dynamic": True,         # 允许动态形状，对序列长度变化友好
+                "mode": "default",  # 或是 "default"，避免 "max-autotune"
+            }
             if args.compile_mode:
-                # mode 具有最高优先级
                 compile_kwargs["mode"] = args.compile_mode
                 compile_kwargs["dynamic"] = args.compile_dynamic
             else:
-                # 使用 backend
                 compile_kwargs["backend"] = args.compile_backend
                 compile_kwargs["dynamic"] = args.compile_dynamic
 
@@ -271,13 +273,12 @@ def main() -> None:
         except Exception as e:
             logging.warning(f"torch.compile failed: {e}, falling back to eager mode")
 
-    # === Parameter statistics ===
     total_params = sum(p.numel() for p in model.parameters())
     emb_params = sum(p.numel() for n, p in model.named_parameters() 
                      if 'embedding' in n or 'emb' in n.lower())
     dense_params = total_params - emb_params
     
-    logging.info(f"PCVRHeteroFormer v7.1 (Architecture-Preserving GSE)")
+    logging.info(f"PCVRHeteroFormer v7.1-fix (NaN-Root-Cause)")
     logging.info(f"GSE config: num_codes={args.gse_num_codes}, code_dim={args.gse_code_dim}, layers={args.gse_num_layers}")
     logging.info(f"Total parameters: {total_params:,} | Embedding: {emb_params:,} | Dense: {dense_params:,}")
     
@@ -302,7 +303,6 @@ def main() -> None:
         "hidden": args.d_model,
     }
 
-    # === Trainer: preserved pattern, GSE aux weight passed ===
     trainer = PCVRHeteroFormerTrainer(
         model=model,
         train_loader=train_loader,
@@ -336,6 +336,13 @@ def main() -> None:
         label_smoothing_min_eps=args.label_smoothing_min_eps,
         label_smoothing_anneal_steps=args.label_smoothing_anneal_steps,
         gse_aux_weight=args.gse_aux_weight,
+        focal_alpha_pos=args.focal_alpha_pos,
+        focal_alpha_neg=args.focal_alpha_neg,
+        focal_max_gamma=args.focal_max_gamma,
+        prior_weight=args.prior_weight,
+        ece_weight=args.ece_weight,
+        lambdarank_weight=args.lambdarank_weight,
+        global_ctr=args.global_ctr,
     )
 
     trainer.train()

@@ -44,15 +44,6 @@ class ModelInput(NamedTuple):
 # Base Primitives (preserved)
 # ==============================================================================
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.weight * x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-
 
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, expand_ratio: float = 4.0):
@@ -106,7 +97,7 @@ class IntraLinear(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.0):
         super().__init__()
         self.proj = nn.Linear(in_dim, out_dim, bias=False)
-        self.norm = RMSNorm(out_dim)
+        self.norm = nn.LayerNorm(out_dim, eps=1e-5)   
         self.dropout = nn.Dropout(dropout)
         nn.init.xavier_uniform_(self.proj.weight)
 
@@ -156,38 +147,35 @@ class VectorQuantizer(nn.Module):
         B, L, D = z.shape
         device = z.device
         
-        # Distances [B*L, K+1]
         z_flat = z.reshape(-1, D)
         distances = torch.cdist(z_flat, self.codebook, p=2).pow(2).view(B, L, self.num_codes + 1)
         
-        # Null mask: empty positions OR fully empty sequences
         null_mask = torch.arange(L, device=device).unsqueeze(0) >= seq_lens.unsqueeze(1)
         null_mask = null_mask | (seq_lens == 0).unsqueeze(1)
         
-        # Logits with null forcing
         temp = self.get_temperature()
         logits = -distances
         logits = logits.masked_fill(null_mask.unsqueeze(-1), -1e4)
         logits[:, :, 0] = logits[:, :, 0].masked_fill(~null_mask, -1e4)
         
-        # Gumbel-Softmax
-        gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-10) + 1e-10)
-        gumbel_logits = (logits + gumbel_noise) / temp
-        probs = F.softmax(gumbel_logits, dim=-1)
+        if temp > 0.2:
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits).clamp(min=1e-10)) + 1e-10)
+            gumbel_logits = torch.clamp((logits + gumbel_noise) / temp, min=-50, max=50)
+            probs = F.softmax(gumbel_logits, dim=-1)
+            quantized = torch.einsum('blk,kd->bld', probs, self.codebook)
+        else:
+            indices = logits.argmax(dim=-1)            # [B, L]
+            quantized = self.codebook[indices]         # [B, L, D]
+            probs = F.one_hot(indices, self.num_codes + 1).float()
         
-        # Quantize
-        quantized = torch.einsum('blk,kd->bld', probs, self.codebook)
-        
-        # Losses (self-contained)
         commitment_loss = F.mse_loss(z, quantized.detach())
         codebook_loss = F.mse_loss(quantized, z.detach())
         
-        # Entropy regularization (exclude null)
         if not null_mask.all():
             valid_probs = probs[~null_mask][:, 1:]
             usage_probs = valid_probs.mean(dim=0)
             entropy = -(usage_probs * torch.log(usage_probs + 1e-10)).sum()
-            entropy_loss = entropy  # FIXED: was -entropy, now positive to encourage code usage concentration
+            entropy_loss = entropy
         else:
             entropy_loss = torch.tensor(0.0, device=device)
         
@@ -202,10 +190,9 @@ class VectorQuantizer(nn.Module):
             'usage_rate': (probs.argmax(dim=-1) != 0).float().mean().item(),
         }
         
-        # Straight-through
         quantized_st = z + (quantized - z).detach()
         self._step_count += 1
-        
+        quantized_st = torch.nan_to_num(quantized_st, nan=0.0)
         return quantized_st, info
 
 
@@ -236,6 +223,7 @@ class GenerativeSequenceEncoder(nn.Module):
         max_seq_len: int = 512,
         id_threshold: int = 10000,
         seq_id_dropout_rate: float = 0.10,
+        init_const_bias: float = -0.5,
     ):
         super().__init__()
         self.d_model = d_model
@@ -292,14 +280,14 @@ class GenerativeSequenceEncoder(nn.Module):
         self.agg_norm = nn.LayerNorm(d_model)
         
         # === Intra: Empty Sequence Gate ===
-        self.empty_state = nn.Parameter(torch.randn(d_model) * 0.02)
+        self.empty_state = nn.Parameter(torch.randn(d_model) * 0.1)
         self.null_gate = nn.Sequential(
             nn.Linear(d_model, d_model // 4, bias=False),
             nn.SiLU(),
             nn.Linear(d_model // 4, 1, bias=True),
         )
         nn.init.normal_(self.null_gate[-1].weight, std=0.01)
-        nn.init.constant_(self.null_gate[-1].bias, -2.0)
+        nn.init.constant_(self.null_gate[-1].bias, init_const_bias)
         
         # === Intra: Output Projection ===
         self.output_proj = nn.Sequential(
@@ -353,6 +341,7 @@ class GenerativeSequenceEncoder(nn.Module):
         
         # Bidirectional encoding (no causal mask)
         encoded = self.transformer(seq_repr, src_key_padding_mask=padding_mask)
+        encoded = torch.nan_to_num(encoded, nan=0.0)
         
         # VQ compression
         code_input = self.to_code(encoded)
@@ -364,6 +353,7 @@ class GenerativeSequenceEncoder(nn.Module):
         kv = quantized.masked_fill(padding_mask.unsqueeze(-1), 0.0)
         aggregated, _ = self.aggregate(agg_query, kv, kv, key_padding_mask=padding_mask)
         aggregated = aggregated.squeeze(1)
+        aggregated = torch.nan_to_num(aggregated, nan=0.0) 
         aggregated = self.agg_norm(aggregated)
         
         # Empty sequence gate
@@ -373,10 +363,11 @@ class GenerativeSequenceEncoder(nn.Module):
         output = self.output_proj(output)
         
         # Store auxiliary info internally (no leakage in return value)
+        # FIX: reduce VQ auxiliary loss weights to prevent gradient domination
         self._last_aux_loss = (
-            0.25 * vq_info['commitment_loss'] + 
-            0.25 * vq_info['codebook_loss'] +
-            0.1 * vq_info['entropy_loss'] +
+            0.1 * vq_info['commitment_loss'] +   # was 0.25
+            0.1 * vq_info['codebook_loss'] +     # was 0.25
+            0.05 * vq_info['entropy_loss'] +     # was 0.1
             0.01 * vq_info['null_reg']
         )
         self._last_info = {
@@ -408,7 +399,7 @@ class InterSelfAttention(nn.Module):
     def __init__(self, d_model: int, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
         self.attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
-        self.norm = RMSNorm(d_model)
+        self.norm = nn.LayerNorm(d_model, eps=1e-5) 
 
     def forward(self, fields: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         keys = sorted(fields.keys())
@@ -424,8 +415,8 @@ class InterCrossAttention(nn.Module):
                  kv_fields: Optional[List[str]] = None):
         super().__init__()
         self.attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
-        self.norm_q = RMSNorm(d_model)
-        self.norm_kv = RMSNorm(d_model)
+        self.norm_q = nn.LayerNorm(d_model, eps=1e-5)   # 原为 RMSNorm
+        self.norm_kv = nn.LayerNorm(d_model, eps=1e-5)  # 原为 RMSNorm
         self.query_fields = query_fields
         self.kv_fields = kv_fields
 
@@ -457,7 +448,7 @@ class InterBilinear(nn.Module):
         self.rank = rank
         self.projs = nn.ModuleList([nn.Linear(d_model, rank, bias=False) for _ in range(num_fields)])
         self.out_proj = nn.Linear(rank, d_model, bias=False)
-        self.norm = RMSNorm(d_model)
+        self.norm = nn.LayerNorm(d_model, eps=1e-5)   # 原为 RMSNorm
         self.scale = rank ** -0.5
         for p in self.projs:
             nn.init.xavier_uniform_(p.weight)
@@ -526,7 +517,7 @@ class PoolConcatLinear(nn.Module):
         super().__init__()
         total_in = sum(field_dims.values())
         self.proj = nn.Linear(total_in, out_dim, bias=False)
-        self.norm = RMSNorm(out_dim)
+        self.norm = nn.LayerNorm(out_dim, eps=1e-5)  
         self.dropout = nn.Dropout(dropout)
         nn.init.xavier_uniform_(self.proj.weight, gain=0.1)
 
@@ -818,6 +809,15 @@ class PCVRHeteroFormer(nn.Module):
             nn.Dropout(dropout),
             apply_spectral_norm(nn.Linear(d_model * 2, action_num, bias=False)),  # 仅最后一层SN
         )
+        # === Calibration Head (新增) ===
+        self.calibrator = nn.Sequential(
+            nn.Linear(action_num, max(action_num * 4, d_model // 4), bias=False),
+            nn.SiLU(),
+            nn.Linear(max(action_num * 4, d_model // 4), action_num, bias=False)
+        )
+        # 用小初始化，使校准器最初接近恒等映射（因有残差连接）
+        nn.init.normal_(self.calibrator[0].weight, std=0.01)
+        nn.init.zeros_(self.calibrator[-1].weight)
         # 中间层xavier初始化
         nn.init.xavier_uniform_(self.predictor[0].weight, gain=0.5)  # FIXED: 保守初始化
         # 谱归一化层不需要xavier初始化
@@ -1028,22 +1028,12 @@ class PCVRHeteroFormer(nn.Module):
 
         # Prediction
         logits = self.predictor(final_repr)
-        logits = logits * self._get_output_scale()  # FIXED: 移除批均值校正，它导致方差爆炸
-        temperature = torch.exp(self.logit_temperature).clamp(min=0.5, max=5.0)
-
-        if self.use_zmlc:
-            # FIXED: 针对TAAC2026极度偏斜分布的ZMLC约束
-            mean_penalty = logits.mean() ** 2
-            std = logits.std()
-            std_target = 0.8  # FIXED: 小batch下的现实目标
-            # 强惩罚偏离目标std，系数增大以对抗BCE坍缩趋势
-            std_penalty = (std - std_target).pow(2) * 5.0
-            std_penalty += F.relu(std - 2.0).pow(2) * 10.0  # 更低硬天花板
-            std_penalty += F.relu(0.15 - std).pow(2) * 3.0  # 更低软地板
-            zmlc = self.zmlc_lambda * (mean_penalty + std_penalty)
-            self._alignment_penalty = zmlc.detach()
-
-        return logits / temperature
+        calib = self.calibrator(logits)
+        logits = logits + 0.1 * calib
+        logits = logits * self._get_output_scale()
+        temperature = torch.clamp(torch.exp(self.logit_temperature), min=0.1, max=5.0)    
+        logits = logits / temperature
+        return logits
 
     def predict(self, model_input: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         logits = self.forward(model_input)
