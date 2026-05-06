@@ -124,9 +124,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--gse_aux_weight', type=float, default=0.3,  # FIX: 0.5 -> 0.3
                         help='Weight for GSE auxiliary losses')
 
-    parser.add_argument('--compile_backend', type=str, default='aot_eager',
+    parser.add_argument('--compile_backend', type=str, default='inductor',
                         help='torch.compile backend')
-    parser.add_argument('--compile_mode', type=str, default='',
+    parser.add_argument('--compile_mode', type=str, default='reduce-overhead',
                         help='torch.compile mode')
     parser.add_argument('--compile_dynamic', action='store_true', default=True)
     parser.add_argument('--compile_suppress_errors', action='store_true', default=True)
@@ -253,23 +253,17 @@ def main() -> None:
         import torch._dynamo
         torch._dynamo.config.suppress_errors = True
         logging.info("Dynamo suppress_errors enabled")
-
+        
     if args.device == 'cuda' and hasattr(torch, 'compile'):
         try:
             compile_kwargs = {
-                "fullgraph": False,      # 不使用全图编译，降低优化激进程度
-                "dynamic": True,         # 允许动态形状，对序列长度变化友好
-                "mode": "default",  # 或是 "default"，避免 "max-autotune"
+                "backend": args.compile_backend, 
+                "fullgraph": False,          # 绝对不要 True，对动态形状不友好
+                "dynamic": args.compile_dynamic,             # 允许可变长度序列
+                "mode": args.compile_mode,   # 或 "default"，避免 max-autotune
             }
-            if args.compile_mode:
-                compile_kwargs["mode"] = args.compile_mode
-                compile_kwargs["dynamic"] = args.compile_dynamic
-            else:
-                compile_kwargs["backend"] = args.compile_backend
-                compile_kwargs["dynamic"] = args.compile_dynamic
-
             model = torch.compile(model, **compile_kwargs)
-            logging.info(f"torch.compile enabled: {compile_kwargs}")
+            logging.info(f"torch.compile enabled (conservative): {compile_kwargs}")
         except Exception as e:
             logging.warning(f"torch.compile failed: {e}, falling back to eager mode")
 

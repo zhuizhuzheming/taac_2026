@@ -110,106 +110,118 @@ class IntraLinear(nn.Module):
 # ==============================================================================
 
 class VectorQuantizer(nn.Module):
-    """
-    Gumbel-Softmax VQ with null code (index 0).
-    Architecture-preserving: self-contained, no external dependencies.
-    """
     def __init__(
         self,
         num_codes: int,
         code_dim: int,
         temperature: float = 1.0,
-        temp_anneal_steps: int = 500,  # FIXED: was 10000->2000, now 500 for very fast hard quantization
-        min_temp: float = 0.05,  # FIXED: was 0.1, lower for sharper assignments
+        temp_anneal_steps: int = 500,
+        min_temp: float = 0.2 ,
     ):
         super().__init__()
         self.num_codes = num_codes
         self.code_dim = code_dim
-        self.temperature = temperature 
-        self.min_temp = min_temp  # FIXED: lower min temp for hard VQ
+        self.init_temp = temperature
+        self.min_temp = min_temp
         self.temp_anneal_steps = temp_anneal_steps
-        
-        # K+1 codes (0=null, 1..K=active)
-        self.codebook = nn.Parameter(torch.randn(num_codes + 1, code_dim))
-        with torch.no_grad():
-            self.codebook[0].fill_(0.0)
-        nn.init.uniform_(self.codebook[1:], -1.0 / num_codes, 1.0 / num_codes)
-        self._step_count = 0
 
-    def get_temperature(self) -> float:
-        if self._step_count >= self.temp_anneal_steps:
-            return self.min_temp
-        progress = self._step_count / self.temp_anneal_steps
-        return self.min_temp + (self.temperature - self.min_temp) * math.exp(-5 * progress)
+        codebook = torch.empty(num_codes + 1, code_dim)
+        nn.init.uniform_(codebook, -1.0 / num_codes, 1.0 / num_codes)
+        codebook[0] = 0.0
+        self.codebook = nn.Parameter(codebook)
 
-    @torch.compiler.disable
-    def forward(self, z: torch.Tensor, seq_lens: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        self.register_buffer('_step_count', torch.tensor(0, dtype=torch.long))
+
+    def get_temperature(self) -> torch.Tensor:
+        progress = torch.clamp(self._step_count.float() / self.temp_anneal_steps, 0.0, 1.0)
+        return self.min_temp + (self.init_temp - self.min_temp) * torch.exp(-5.0 * progress)
+
+    def forward(
+        self, z: torch.Tensor, seq_lens: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         B, L, D = z.shape
         device = z.device
-        
-        z_flat = z.reshape(-1, D)
+
+        # ---- 数值保护 ----
+        z_safe = torch.nan_to_num(z, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        # ---- 距离计算 ----
+        z_flat = z_safe.reshape(-1, D)
         distances = torch.cdist(z_flat, self.codebook, p=2).pow(2).view(B, L, self.num_codes + 1)
-        
+        distances = torch.clamp(distances, min=0.0, max=1e8)
+
+        # ---- null_mask (纯张量) ----
+        # seq_lens: [B] → [B, 1]; arange: [L] → [1, L]
         null_mask = torch.arange(L, device=device).unsqueeze(0) >= seq_lens.unsqueeze(1)
-        null_mask = null_mask | (seq_lens == 0).unsqueeze(1)
-        
+        null_mask = null_mask | (seq_lens == 0).unsqueeze(1)  # [B, L]
+
+        # ---- 温度 ----
         temp = self.get_temperature()
+
+        # ---- logits + mask (纯张量) ----
         logits = -distances
-        logits = logits.masked_fill(null_mask.unsqueeze(-1), -1e4)
-        logits[:, :, 0] = logits[:, :, 0].masked_fill(~null_mask, -1e4)
-        
-        if temp > 0.2:
-            gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits).clamp(min=1e-10)) + 1e-10)
-            gumbel_logits = torch.clamp((logits + gumbel_noise) / temp, min=-50, max=50)
-            probs = F.softmax(gumbel_logits, dim=-1)
-            quantized = torch.einsum('blk,kd->bld', probs, self.codebook)
-        else:
-            indices = logits.argmax(dim=-1)            # [B, L]
-            quantized = self.codebook[indices]         # [B, L, D]
-            probs = F.one_hot(indices, self.num_codes + 1).float()
-        
-        commitment_loss = F.mse_loss(z, quantized.detach())
-        codebook_loss = F.mse_loss(quantized, z.detach())
-        
-        if not null_mask.all():
-            valid_probs = probs[~null_mask][:, 1:]
-            usage_probs = valid_probs.mean(dim=0)
-            entropy = -(usage_probs * torch.log(usage_probs + 1e-10)).sum()
-            entropy_loss = entropy
-        else:
-            entropy_loss = torch.tensor(0.0, device=device)
-        
+        # null 位置的所有 code 设为 -1e4
+        logits = torch.where(null_mask.unsqueeze(-1), torch.tensor(-1e4, device=device), logits)
+        # 非 null 位置的 code 0 (null code) 设为 -1e4
+        logits[:, :, 0] = torch.where(~null_mask, torch.tensor(-1e4, device=device), logits[:, :, 0])
+
+        # ---- 软、硬量化混合 (纯张量，无 if) ----
+        noise = torch.rand_like(logits).clamp(min=1e-10)
+        noise = -torch.log(-torch.log(noise) + 1e-10)
+        gumbel_logits = (logits + noise) / temp.clamp(min=1e-5)
+        gumbel_logits = torch.clamp(gumbel_logits, min=-50, max=50)
+        soft_probs = F.softmax(gumbel_logits, dim=-1)
+        soft_quantized = torch.einsum('blk,kd->bld', soft_probs, self.codebook)
+
+        hard_indices = logits.argmax(dim=-1)
+        hard_quantized = self.codebook[hard_indices]
+        hard_probs = F.one_hot(hard_indices, self.num_codes + 1).float()
+
+        # 混合权重：temp > 0.2 时软量化权重为1，否则为0
+        soft_weight = (temp > 0.2).float()  # scalar tensor
+        quantized = soft_weight * soft_quantized + (1 - soft_weight) * hard_quantized
+        probs = soft_weight * soft_probs + (1 - soft_weight) * hard_probs
+
+        # ---- 损失 (纯张量) ----
+        commitment_loss = F.mse_loss(z_safe, quantized.detach())
+        codebook_loss = F.mse_loss(quantized, z_safe.detach())
+
+        # ---- 熵损失 (纯张量) ----
+        probs_active = probs[:, :, 1:]
+        log_probs = torch.log(probs_active + 1e-10)
+        entropy_per_pos = -(probs_active * log_probs).sum(dim=-1)  # [B, L]
+
+        valid_mask = ~null_mask
+        valid_count = valid_mask.sum()
+        safe_count = torch.clamp(valid_count, min=1)
+        entropy_loss = torch.where(
+            valid_count > 0,
+            (entropy_per_pos * valid_mask).sum() / safe_count,
+            torch.tensor(0.0, device=device)
+        )
+
         null_reg = self.codebook[0].pow(2).mean()
-        
+
+        # ---- 直通估计器 ----
+        quantized_st = z_safe + (quantized - z_safe).detach()
+        quantized_st = torch.nan_to_num(quantized_st, nan=0.0)
+
+        # ---- 监控指标 (纯张量，无 .item()) ----
+        usage_rate = (probs.argmax(dim=-1) != 0).float().mean()
+
         info = {
             'commitment_loss': commitment_loss,
             'codebook_loss': codebook_loss,
             'entropy_loss': entropy_loss,
             'null_reg': null_reg,
             'temperature': temp,
-            'usage_rate': (probs.argmax(dim=-1) != 0).float().mean().item(),
+            'usage_rate': usage_rate,
         }
-        
-        quantized_st = z + (quantized - z).detach()
+
         self._step_count += 1
-        quantized_st = torch.nan_to_num(quantized_st, nan=0.0)
         return quantized_st, info
 
-
 class GenerativeSequenceEncoder(nn.Module):
-    """
-    Intra-field operation for sequence encoding.
-    
-    Interface contract (same as old SequenceEncoder):
-    - Input:  seq_ids [B, n_feats, max_len], seq_lens [B], optional time_buckets, decay_weight
-    - Output: [B, d_model] pooled representation
-    
-    Internal architecture (generative paradigm):
-    Feature Embedding → Bidirectional Transformer → VQ Compression → 
-    Attention Aggregation → Empty Gate → Output
-    
-    Auxiliary losses stored internally, accessible via get_aux_loss() / get_diagnostics().
-    """
     def __init__(
         self,
         vocab_sizes: List[int],
@@ -256,7 +268,7 @@ class GenerativeSequenceEncoder(nn.Module):
         else:
             self.time_emb = None
         
-        # === Intra: Bidirectional Transformer (no causal mask, no exposure bias) ===
+        # === Intra: Bidirectional Transformer ===
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=num_heads,
@@ -267,17 +279,20 @@ class GenerativeSequenceEncoder(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # === Intra: VQ Compression (generative core) ===
+        # === Intra: VQ Compression ===
         self.vq = VectorQuantizer(num_codes, code_dim)
         self.to_code = nn.Linear(d_model, code_dim, bias=False)
         self.from_code = nn.Linear(code_dim, d_model, bias=False)
         nn.init.xavier_uniform_(self.to_code.weight, gain=0.1)
         nn.init.xavier_uniform_(self.from_code.weight, gain=0.1)
         
-        # === Intra: Attention Aggregation (pool within field) ===
+        # === Intra: Attention Aggregation ===
         self.agg_token = nn.Parameter(torch.randn(1, 1, d_model))
         self.aggregate = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
         self.agg_norm = nn.LayerNorm(d_model)
+        
+        # === Intra: Empty Sequence Token (enters transformer) ===
+        self.empty_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.1)
         
         # === Intra: Empty Sequence Gate ===
         self.empty_state = nn.Parameter(torch.randn(d_model) * 0.1)
@@ -297,7 +312,6 @@ class GenerativeSequenceEncoder(nn.Module):
         )
         nn.init.xavier_uniform_(self.output_proj[0].weight, gain=0.1)
         
-        # === Internal state for auxiliary loss extraction ===
         self._last_aux_loss: Optional[torch.Tensor] = None
         self._last_info: Dict[str, float] = {}
 
@@ -308,20 +322,16 @@ class GenerativeSequenceEncoder(nn.Module):
         time_buckets: Optional[torch.Tensor] = None,
         decay_weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Pure forward: returns [B, d_model] only.
-        Auxiliary info stored internally for later extraction.
-        """
         B, n_feats, max_len = seq_ids.shape
         device = seq_ids.device
         
-        # ID dropout (training only)
+        # === [1] ID dropout (纯张量) ===
         if self.training and self.seq_id_dropout_rate > 0:
             valid_mask = seq_ids > 0
             drop_mask = torch.rand_like(seq_ids.float()) > self.seq_id_dropout_rate
             seq_ids = seq_ids * (valid_mask & drop_mask).long()
         
-        # Multi-feature embedding (Intra-op: field composition)
+        # === [2] Multi-feature embedding ===
         feat_embs = []
         for i in range(n_feats):
             emb = self.feat_embs[i](seq_ids[:, i, :])
@@ -329,65 +339,85 @@ class GenerativeSequenceEncoder(nn.Module):
             feat_embs.append(emb)
         
         seq_repr = torch.cat(feat_embs, dim=-1)
-        seq_repr = self.seq_norm(self.seq_proj(seq_repr))
+        seq_repr = self.seq_norm(self.seq_proj(seq_repr))  # [B, L, D]
         
-        # Time embedding
+        # === [3] Empty Sequence Handling (纯张量，无 if，无动态索引) ===
+        # empty_mask: [B] bool → expand to [B, 1, D] for broadcasting
+        empty_mask = (seq_lens == 0)  # [B]
+        empty_mask_3d = empty_mask.unsqueeze(-1).unsqueeze(-1).expand(-1, max_len, self.d_model)
+        
+        # empty_token_broadcast: [1, 1, D] → [B, L, D]，但只有第0位有意义
+        empty_token_broadcast = self.empty_token.expand(B, max_len, -1)
+        # 构造位置掩码：只有第0位替换
+        pos0_mask = torch.zeros(B, max_len, 1, device=device, dtype=torch.bool)
+        pos0_mask[:, 0, :] = True
+        # 组合：空序列 & 第0位 → 替换为 empty_token
+        replace_mask = empty_mask_3d & pos0_mask.expand(-1, -1, self.d_model)
+        seq_repr = torch.where(replace_mask, empty_token_broadcast, seq_repr)
+        
+        # effective_lens: 空序列设为1，否则保持原值
+        effective_lens = torch.where(empty_mask, torch.ones_like(seq_lens), seq_lens)
+        
+        # === [4] Time embedding ===
         if self.time_emb is not None and time_buckets is not None:
             t_emb = self.time_emb(time_buckets)
             seq_repr = seq_repr + t_emb
         
-        # Padding mask
-        padding_mask = torch.arange(max_len, device=device).unsqueeze(0) >= seq_lens.unsqueeze(1)
+        # === [5] Padding mask (基于 effective_lens，避免全True) ===
+        # arange: [max_len] → [1, max_len]; effective_lens: [B] → [B, 1]
+        padding_mask = torch.arange(max_len, device=device).unsqueeze(0) >= effective_lens.unsqueeze(1)
+        # 额外保护：确保空序列的第0位不被mask（虽然effective_lens=1已保证，但双重保险）
+        # 实际上不需要，因为 effective_lens=1 时 arange[0]=0 < 1，mask[0]=False
         
-        # Bidirectional encoding (no causal mask)
+        # === [6] Bidirectional encoding ===
         encoded = self.transformer(seq_repr, src_key_padding_mask=padding_mask)
-        encoded = torch.nan_to_num(encoded, nan=0.0)
+        encoded = torch.nan_to_num(encoded, nan=0.0, posinf=1e4, neginf=-1e4)
         
-        # VQ compression
+        # === [7] VQ compression ===
         code_input = self.to_code(encoded)
-        quantized, vq_info = self.vq(code_input, seq_lens)
+        # VQ 内部使用 effective_lens 构造 null_mask
+        quantized, vq_info = self.vq(code_input, effective_lens)
         quantized = self.from_code(quantized)
         
-        # Attention aggregation
+        # === [8] Attention aggregation ===
         agg_query = self.agg_token.expand(B, -1, -1)
+        # kv: 用 padding_mask 填充0（纯张量）
         kv = quantized.masked_fill(padding_mask.unsqueeze(-1), 0.0)
         aggregated, _ = self.aggregate(agg_query, kv, kv, key_padding_mask=padding_mask)
         aggregated = aggregated.squeeze(1)
-        aggregated = torch.nan_to_num(aggregated, nan=0.0) 
+        aggregated = torch.nan_to_num(aggregated, nan=0.0, posinf=1e4, neginf=-1e4)
         aggregated = self.agg_norm(aggregated)
-        
-        # Empty sequence gate
+
+        # === [9] Empty sequence gate (学习性混合，非强制替换) ===
         null_logits = self.null_gate(aggregated)
-        null_gate = torch.sigmoid(null_logits)
-        output = null_gate * self.empty_state + (1 - null_gate) * aggregated
+        null_gate = torch.sigmoid(null_logits)  # [B, 1]
+        # empty_state: [D] → [1, D] → [B, D]
+        empty_state_broadcast = self.empty_state.unsqueeze(0).expand(B, -1)
+        output = null_gate * empty_state_broadcast + (1 - null_gate) * aggregated
         output = self.output_proj(output)
-        
-        # Store auxiliary info internally (no leakage in return value)
-        # FIX: reduce VQ auxiliary loss weights to prevent gradient domination
+
+        # === [10] 保存辅助损失 ===
         self._last_aux_loss = (
-            0.1 * vq_info['commitment_loss'] +   # was 0.25
-            0.1 * vq_info['codebook_loss'] +     # was 0.25
-            0.05 * vq_info['entropy_loss'] +     # was 0.1
+            0.1 * vq_info['commitment_loss'] +
+            0.1 * vq_info['codebook_loss'] +
+            0.05 * vq_info['entropy_loss'] +
             0.01 * vq_info['null_reg']
         )
         self._last_info = {
-            k: v for k, v in vq_info.items() 
-            if k in ['temperature', 'usage_rate', 'null_gate_mean', 'null_gate_std', 'empty_ratio']
+            k: v.item() for k, v in vq_info.items() 
+            if k in ['temperature', 'usage_rate']
         }
         self._last_info['null_gate_mean'] = null_gate.mean().item()
         self._last_info['null_gate_std'] = null_gate.std().item()
-        self._last_info['empty_ratio'] = (seq_lens == 0).float().mean().item()
-        
+        self._last_info['empty_ratio'] = empty_mask.float().mean().item()
         return output
     
     def get_aux_loss(self) -> torch.Tensor:
-        """External interface for auxiliary loss extraction."""
         if self._last_aux_loss is not None and self.training:
             return self._last_aux_loss
         return torch.tensor(0.0, device=next(self.parameters()).device)
     
     def get_diagnostics(self) -> Dict[str, float]:
-        """External interface for diagnostic info extraction."""
         return self._last_info.copy()
 
 

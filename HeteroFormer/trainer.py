@@ -507,7 +507,6 @@ class PCVRHeteroFormerTrainer:
                     )
 
     def _train_step(self, batch: Dict[str, Any]) -> float:
-        torch.autograd.set_detect_anomaly(True)
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
 
@@ -568,7 +567,7 @@ class PCVRHeteroFormerTrainer:
         gse_aux_loss = torch.tensor(0.0, device=self.device)
         if hasattr(self.model, 'get_aux_loss'):
             gse_aux_loss = self.model.get_aux_loss()
-        aux_weight = max(0.001, self.gse_aux_weight * math.exp(-self.global_step / 2000.0))
+        aux_weight = self.gse_aux_weight
         # LambdaRank 模式下进一步降低 GSE 权重，避免干扰排序目标
         if self.use_lambda_rank:
             aux_weight *= 0.1

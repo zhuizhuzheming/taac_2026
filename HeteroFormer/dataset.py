@@ -1,18 +1,9 @@
-"""PCVR Parquet dataset module (performance-tuned).
+"""PCVR Parquet dataset module (performance-tuned v6.2-pool).
 
-Reads raw multi-column Parquet directly and obtains feature metadata from
-``schema.json``.
-
-Optimizations:
-- Pre-allocated numpy buffers to eliminate ``np.zeros`` + ``np.stack`` overhead.
-- Fused padding loop over sequence domains that writes directly into a 3D buffer.
-- Pre-computed column-index lookup to avoid per-row string lookups.
-- ``file_system`` tensor-sharing strategy to work around ``/dev/shm`` exhaustion
-  when using many DataLoader workers.
-
-CRITICAL FIX (v5.1):
-- pCVR 标签过滤：只保留点击样本（label_type=1 或 2），丢弃曝光未点击样本（label_type=0）。
-- 这是 pCVR = P(convert|click) 的根本性数据修正。
+Optimizations (v6.2-pool):
+- DynamicBufferPool: 按 (B, key) 复用已分配的 numpy 缓冲区
+- Worker-local buffer shuffle
+- Arrow batch 切割适配固定 batch size
 """
 
 import os
@@ -20,6 +11,7 @@ import logging
 import random
 import json
 import gc
+import threading
 
 import numpy as np
 import pyarrow as pa
@@ -35,6 +27,74 @@ except ImportError:
     class _NptFallback:
         NDArray = Any
     npt = _NptFallback()
+
+
+# ─────────────────────────── Dynamic Buffer Pool ─────────────────────────────
+
+
+class DynamicBufferPool:
+    """
+    动态大小的缓冲区池，按 (batch_size, key) 复用 numpy 数组。
+    
+    设计原则:
+    1. 线程安全: 每个 worker 独立实例，无需锁
+    2. 惰性分配: 首次请求某 (B, key) 时才分配
+    3. 零初始化: 返回前自动清零，保证数据干净
+    4. 容量控制: 限制 pool 中保留的最大 batch_size 种类数
+    """
+    
+    def __init__(self, max_size_types: int = 4):
+        self._pools: Dict[Tuple[int, str], np.ndarray] = {}
+        self._max_size_types = max_size_types
+        self._access_order: List[Tuple[int, str]] = []  # LRU 淘汰
+        
+    def get(self, B: int, key: str, shape: Tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+        """
+        获取大小为 (B, *shape) 的缓冲区。
+        
+        Args:
+            B: batch size (第一维度)
+            key: 缓冲区标识 (如 'user_int', 'seq_a')
+            shape: 除第一维外的形状
+            dtype: 数据类型
+            
+        Returns:
+            已清零的 numpy 数组，形状为 (B, *shape)
+        """
+        pool_key = (B, key)
+        
+        if pool_key in self._pools:
+            # 命中缓存，更新访问顺序
+            if pool_key in self._access_order:
+                self._access_order.remove(pool_key)
+            self._access_order.append(pool_key)
+            buf = self._pools[pool_key]
+            buf.fill(0)  # 清零复用
+            return buf
+        
+        # 未命中，分配新缓冲区
+        # LRU 淘汰: 如果 size types 过多，移除最久未使用的
+        current_sizes = set(k[0] for k in self._pools.keys())
+        if len(current_sizes) >= self._max_size_types and B not in current_sizes:
+            # 找到最久未使用的、不同 size 的 key 淘汰
+            for old_key in list(self._access_order):
+                if old_key[0] != B:
+                    del self._pools[old_key]
+                    self._access_order.remove(old_key)
+                    break
+        
+        # 分配新缓冲区
+        full_shape = (B,) + shape
+        buf = np.zeros(full_shape, dtype=dtype)
+        self._pools[pool_key] = buf
+        self._access_order.append(pool_key)
+        
+        return buf
+    
+    def clear(self):
+        """清空 pool，释放内存"""
+        self._pools.clear()
+        self._access_order.clear()
 
 
 # ─────────────────────────── Feature Schema ──────────────────────────────────
@@ -81,7 +141,6 @@ class FeatureSchema:
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-# v5.1: 优化时间桶边界，增加近期粒度（前30个边界集中在1小时内）
 BUCKET_BOUNDARIES = np.array([
     5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60,
     120, 180, 240, 300, 360, 420, 480, 540, 600,
@@ -101,7 +160,7 @@ NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
 
-    v5.1: 只保留点击样本（label_type=1 或 2）用于 pCVR 训练。
+    v6.2-pool: DynamicBufferPool for efficient memory reuse.
     """
 
     def __init__(
@@ -152,23 +211,11 @@ class PCVRParquetDataset(IterableDataset):
         schema_names = pf.schema_arrow.names
         self._col_idx = {name: i for i, name in enumerate(schema_names)}
 
-        # v5.1: 增大 buffer 以更好打散序列相关性
         self._effective_buffer = max(buffer_batches, 50)
 
-        # Pre-allocate buffers
-        B = batch_size
-        self._buf_user_int = np.zeros((B, self.user_int_schema.total_dim), dtype=np.int64)
-        self._buf_item_int = np.zeros((B, self.item_int_schema.total_dim), dtype=np.int64)
-        self._buf_user_dense = np.zeros((B, self.user_dense_schema.total_dim), dtype=np.float32)
-        self._buf_seq = {}
-        self._buf_seq_tb = {}
-        self._buf_seq_lens = {}
-        for domain in self.seq_domains:
-            max_len = self._seq_maxlen[domain]
-            n_feats = len(self.sideinfo_fids[domain])
-            self._buf_seq[domain] = np.zeros((B, n_feats, max_len), dtype=np.int64)
-            self._buf_seq_tb[domain] = np.zeros((B, max_len), dtype=np.int64)
-            self._buf_seq_lens[domain] = np.zeros(B, dtype=np.int64)
+        # v6.2-pool: 每个 dataset 实例一个 buffer pool
+        # 由于每个 worker 会序列化/反序列化 dataset，每个 worker 会有独立 pool
+        self._buffer_pool = DynamicBufferPool(max_size_types=4)
 
         self._user_int_plan = []
         offset = 0
@@ -205,10 +252,9 @@ class PCVRParquetDataset(IterableDataset):
             self._seq_plan[domain] = (side_plan, ts_ci)
 
         logging.info(
-            f"PCVRParquetDataset v5.1: {self.num_rows} rows from "
+            f"PCVRParquetDataset v6.2-pool: {self.num_rows} rows from "
             f"{len(self._parquet_files)} file(s), batch_size={batch_size}, "
-            f"buffer_batches={self._effective_buffer}, shuffle={shuffle}, "
-            f"pCVR_mode=click_only")
+            f"buffer_batches={self._effective_buffer}, shuffle={shuffle}")
 
     def _load_schema(self, schema_path: str, seq_max_lens: Dict[str, int]) -> None:
         with open(schema_path, 'r', encoding='utf-8') as f:
@@ -275,20 +321,46 @@ class PCVRParquetDataset(IterableDataset):
                        if i % worker_info.num_workers == worker_info.id]
 
         buffer: List[Dict[str, Any]] = []
+        
         for file_path, rg_idx, _ in rg_list:
             pf = pq.ParquetFile(file_path)
-            for batch in pf.iter_batches(batch_size=self.batch_size, row_groups=[rg_idx]):
-                batch_dict = self._convert_batch(batch)
-                # v5.1: 跳过无点击样本的 batch
-                if batch_dict is None:
-                    continue
-                if self.shuffle and self._effective_buffer > 1:
-                    buffer.append(batch_dict)
-                    if len(buffer) >= self._effective_buffer:
-                        yield from self._flush_buffer(buffer)
-                        buffer = []
+            arrow_batch_size = self.batch_size * 2
+            for batch in pf.iter_batches(batch_size=arrow_batch_size, row_groups=[rg_idx]):
+                batch_size_actual = batch.num_rows
+                
+                if batch_size_actual > self.batch_size * 2:
+                    # 大 batch 切割
+                    for start in range(0, batch_size_actual, self.batch_size):
+                        end = min(start + self.batch_size, batch_size_actual)
+                        sub_batch = batch.slice(start, end - start)
+                        sub_B = end - start
+                        
+                        batch_dict = self._convert_batch(sub_batch)
+                        if batch_dict is None:
+                            continue
+                        
+                        # v6.2-fix: 只有满 batch 才进入 shuffle buffer
+                        if sub_B == self.batch_size and self.shuffle and self._effective_buffer > 1:
+                            buffer.append(batch_dict)
+                            if len(buffer) >= self._effective_buffer:
+                                yield from self._flush_buffer(buffer)
+                                buffer = []
+                        else:
+                            # 不满 batch_size 的直接 yield（不 shuffle）
+                            yield batch_dict
                 else:
-                    yield batch_dict
+                    batch_dict = self._convert_batch(batch)
+                    if batch_dict is None:
+                        continue
+                    
+                    actual_B = batch_dict['label'].shape[0]
+                    if actual_B == self.batch_size and self.shuffle and self._effective_buffer > 1:
+                        buffer.append(batch_dict)
+                        if len(buffer) >= self._effective_buffer:
+                            yield from self._flush_buffer(buffer)
+                            buffer = []
+                    else:
+                        yield batch_dict
 
         if buffer:
             yield from self._flush_buffer(buffer)
@@ -299,37 +371,50 @@ class PCVRParquetDataset(IterableDataset):
     def _flush_buffer(
         self, buffer: List[Dict[str, Any]]
     ) -> Iterator[Dict[str, Any]]:
-        # v5.3-gpu: 使用 pinned memory 减少 CPU->GPU 传输开销
+        """Stack+view 替代 cat，预分块"""
+        if not buffer:
+            return
+        
         merged: Dict[str, torch.Tensor] = {}
         non_tensor_keys: Dict[str, Any] = {}
+        
         for k in buffer[0].keys():
             if isinstance(buffer[0][k], torch.Tensor):
-                # v5.3-gpu: 直接 cat，不做 clone/copy
-                merged[k] = torch.cat([b[k] for b in buffer], dim=0)
+                stacked = torch.stack([b[k] for b in buffer], dim=0)
+                new_shape = (-1,) + stacked.shape[2:]
+                merged[k] = stacked.view(new_shape)
             else:
                 non_tensor_keys[k] = buffer[0][k]
+        
         total_rows = merged['label'].shape[0]
-        # v5.3-gpu: shuffle 用 torch 生成，保持 tensor 格式
-        rand_idx = torch.randperm(total_rows) if self.shuffle else None
-        for i in range(0, total_rows, self.batch_size):
-            end = min(i + self.batch_size, total_rows)
+        
+        if self.shuffle:
+            rand_idx = torch.randperm(total_rows)
+        else:
+            rand_idx = None
+        
+        batch_size = self.batch_size
+        num_batches = (total_rows + batch_size - 1) // batch_size
+        
+        for i in range(num_batches):
+            start = i * batch_size
+            end = min(start + batch_size, total_rows)
+            
             if rand_idx is not None:
-                idx = rand_idx[i:end]
+                idx = rand_idx[start:end]
             else:
-                idx = slice(i, end)
-            batch: Dict[str, Any] = {k: v[idx] for k, v in merged.items()}
+                idx = slice(start, end)
+            
+            batch: Dict[str, Any] = {}
+            for k, v in merged.items():
+                batch[k] = v[idx]
             batch.update(non_tensor_keys)
+            
             if self.is_training and batch['label'].sum() == 0:
-                continue   # 跳过全负 batch，让 LambdaRank 至少有一个正样本
-            skip = False
-            for domain in batch['_seq_domains']:
-                lengths = batch[f'{domain}_len']
-                if (lengths == 0).all():
-                    skip = True
-                    break
-            if skip:
                 continue
+            
             yield batch
+        
         del merged, rand_idx
         buffer.clear()
 
@@ -430,13 +515,13 @@ class PCVRParquetDataset(IterableDataset):
 
         return padded
 
-    # v5.2: 核心修复 - 双时间尺度衰减权重
     def _convert_batch(self, batch: "pa.RecordBatch") -> Optional[Dict[str, Any]]:
         """Convert an Arrow RecordBatch into a training-ready dict of tensors.
 
-        v5.3-gpu: 完全向量化实现，消除 Python 循环瓶颈。
+        v6.2-pool: 使用 DynamicBufferPool 复用缓冲区。
         """
         B = batch.num_rows
+        pool = self._buffer_pool
 
         # ---- meta ----
         timestamps = batch.column(self._col_idx['timestamp']).to_numpy().astype(np.int64)
@@ -460,9 +545,9 @@ class PCVRParquetDataset(IterableDataset):
         user_ids_all = batch.column(self._col_idx['user_id']).to_pylist()
         user_ids = [user_ids_all[i] for i in range(len(user_ids_all)) if click_mask[i]] if n_keep < len(user_ids_all) else user_ids_all
 
-        # ---- user_int (向量化) ----
-        user_int_full = self._buf_user_int[:batch.num_rows]
-        user_int_full[:] = 0
+        # v6.2-pool: 使用 pool 获取缓冲区
+        # ---- user_int ----
+        user_int = pool.get(B, 'user_int', (self.user_int_schema.total_dim,), np.int64)
         for ci, dim, offset, vs in self._user_int_plan:
             col = batch.column(ci)
             if dim == 1:
@@ -472,20 +557,23 @@ class PCVRParquetDataset(IterableDataset):
                     self._record_oob('user_int', ci, arr, vs)
                 else:
                     arr[:] = 0
-                user_int_full[:, offset] = arr
+                if n_keep < batch.num_rows:
+                    user_int[:, offset] = arr[click_mask]
+                else:
+                    user_int[:, offset] = arr
             else:
                 padded, _ = self._pad_varlen_int_column(col, dim, batch.num_rows)
                 if vs > 0:
                     self._record_oob('user_int', ci, padded, vs)
                 else:
                     padded[:] = 0
-                user_int_full[:, offset:offset + dim] = padded
+                if n_keep < batch.num_rows:
+                    user_int[:, offset:offset + dim] = padded[click_mask]
+                else:
+                    user_int[:, offset:offset + dim] = padded
 
-        user_int = user_int_full[click_mask] if n_keep < batch.num_rows else user_int_full[:B]
-
-        # ---- item_int (向量化) ----
-        item_int_full = self._buf_item_int[:batch.num_rows]
-        item_int_full[:] = 0
+        # ---- item_int ----
+        item_int = pool.get(B, 'item_int', (self.item_int_schema.total_dim,), np.int64)
         for ci, dim, offset, vs in self._item_int_plan:
             col = batch.column(ci)
             if dim == 1:
@@ -495,26 +583,30 @@ class PCVRParquetDataset(IterableDataset):
                     self._record_oob('item_int', ci, arr, vs)
                 else:
                     arr[:] = 0
-                item_int_full[:, offset] = arr
+                if n_keep < batch.num_rows:
+                    item_int[:, offset] = arr[click_mask]
+                else:
+                    item_int[:, offset] = arr
             else:
                 padded, _ = self._pad_varlen_int_column(col, dim, batch.num_rows)
                 if vs > 0:
                     self._record_oob('item_int', ci, padded, vs)
                 else:
                     padded[:] = 0
-                item_int_full[:, offset:offset + dim] = padded
+                if n_keep < batch.num_rows:
+                    item_int[:, offset:offset + dim] = padded[click_mask]
+                else:
+                    item_int[:, offset:offset + dim] = padded
 
-        item_int = item_int_full[click_mask] if n_keep < batch.num_rows else item_int_full[:B]
-
-        # ---- user_dense (向量化) ----
-        user_dense_full = self._buf_user_dense[:batch.num_rows]
-        user_dense_full[:] = 0
+        # ---- user_dense ----
+        user_dense = pool.get(B, 'user_dense', (self.user_dense_schema.total_dim,), np.float32)
         for ci, dim, offset in self._user_dense_plan:
             col = batch.column(ci)
             padded = self._pad_varlen_float_column(col, dim, batch.num_rows)
-            user_dense_full[:, offset:offset + dim] = padded
-
-        user_dense = user_dense_full[click_mask] if n_keep < batch.num_rows else user_dense_full[:B]
+            if n_keep < batch.num_rows:
+                user_dense[:, offset:offset + dim] = padded[click_mask]
+            else:
+                user_dense[:, offset:offset + dim] = padded
 
         labels = labels[click_mask] if n_keep < batch.num_rows else labels[:B]
 
@@ -529,12 +621,12 @@ class PCVRParquetDataset(IterableDataset):
             '_seq_domains': self.seq_domains,
         }
 
-        # ---- Sequence features (v5.3-gpu: 完全向量化) ----
+        # ---- Sequence features ----
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
+            n_feats = len(self.sideinfo_fids[domain])
             side_plan, ts_ci = self._seq_plan[domain]
 
-            # v5.3-gpu: 一次性获取所有列的 offsets/values
             all_offsets = []
             all_values = []
             all_vs = []
@@ -547,18 +639,13 @@ class PCVRParquetDataset(IterableDataset):
                 all_vs.append(vs)
                 all_ci.append(ci)
 
-            # 向量化填充：使用 numpy 高级索引替代 Python 循环
-            out_full = self._buf_seq[domain][:batch.num_rows]
-            out_full[:] = 0
-            lengths_full = self._buf_seq_lens[domain][:batch.num_rows]
-            lengths_full[:] = 0
+            # v6.2-pool: 动态获取序列缓冲区
+            out_full = pool.get(batch.num_rows, f'seq_{domain}', (n_feats, max_len), np.int64)
+            lengths_full = pool.get(batch.num_rows, f'seq_len_{domain}', (), np.int64)
 
-            # v5.3-gpu: 向量化序列填充（替代逐样本 for 循环）
             for c, (offs, vals, vs, ci) in enumerate(zip(all_offsets, all_values, all_vs, all_ci)):
-                # 计算每个样本的有效长度
                 raw_lens = offs[1:] - offs[:-1]
                 use_lens = np.minimum(raw_lens, max_len)
-                # 向量化：为每个样本构建索引
                 for i in range(batch.num_rows):
                     if use_lens[i] > 0:
                         s = int(offs[i])
@@ -575,24 +662,26 @@ class PCVRParquetDataset(IterableDataset):
                 else:
                     slice_c[:] = 0
 
-            out = out_full[click_mask] if n_keep < batch.num_rows else out_full[:B]
-            lengths = lengths_full[click_mask] if n_keep < batch.num_rows else lengths_full[:B]
+            if n_keep < batch.num_rows:
+                out = out_full[click_mask]
+                lengths = lengths_full[click_mask]
+            else:
+                out = out_full[:B]
+                lengths = lengths_full[:B]
 
             result[domain] = torch.from_numpy(out.copy())
             result[f'{domain}_len'] = torch.from_numpy(lengths.copy())
 
-            # Time bucketing + decay weights (v5.3-gpu: 向量化)
-            time_bucket_full = self._buf_seq_tb[domain][:batch.num_rows]
-            time_bucket_full[:] = 0
-            decay_weight_full = np.zeros((batch.num_rows, max_len), dtype=np.float32)
+            # Time bucketing + decay weights
+            time_bucket = pool.get(B, f'seq_tb_{domain}', (max_len,), np.int64)
+            decay_weight = pool.get(B, f'seq_dw_{domain}', (max_len,), np.float32)
 
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
                 ts_vals = ts_col.values.to_numpy()
 
-                # v5.3-gpu: 向量化时间戳填充
-                ts_padded = np.zeros((batch.num_rows, max_len), dtype=np.int64)
+                ts_padded = pool.get(batch.num_rows, f'ts_pad_{domain}', (max_len,), np.int64)
                 raw_lens = ts_offs[1:] - ts_offs[:-1]
                 use_lens = np.minimum(raw_lens, max_len)
                 for i in range(batch.num_rows):
@@ -601,30 +690,25 @@ class PCVRParquetDataset(IterableDataset):
                         e = s + int(use_lens[i])
                         ts_padded[i, :use_lens[i]] = ts_vals[s:e]
 
-                # 向量化时间差计算
-                ts_expanded = timestamps.reshape(-1, 1) if n_keep < batch.num_rows else timestamps[:B].reshape(-1, 1)
+                ts_expanded = timestamps.reshape(-1, 1)
                 ts_padded_filtered = ts_padded[click_mask] if n_keep < batch.num_rows else ts_padded[:B]
                 time_diff = np.maximum(ts_expanded - ts_padded_filtered, 0)
 
-                # 向量化 bucket 计算
                 raw_buckets = np.clip(
                     np.searchsorted(BUCKET_BOUNDARIES, time_diff.ravel()),
                     0, len(BUCKET_BOUNDARIES) - 1,
                 )
                 buckets = raw_buckets.reshape(B, max_len) + 1
                 buckets[ts_padded_filtered == 0] = 0
-                time_bucket_full[:B] = buckets
+                time_bucket[:] = buckets
 
-                # v5.3-gpu: 向量化衰减权重（替代逐元素循环）
                 time_diff_f = time_diff.astype(np.float32)
                 decay_short = np.exp(-time_diff_f / 3600.0)
                 decay_long = np.exp(-time_diff_f / 86400.0)
-                decay_weight_full[:B] = 0.7 * decay_short + 0.3 * decay_long
-                decay_weight_full[:B][ts_padded_filtered == 0] = 0.0
+                decay_weight[:] = 0.7 * decay_short + 0.3 * decay_long
+                decay_weight[ts_padded_filtered == 0] = 0.0
 
-            time_bucket = time_bucket_full[:B]
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
-            decay_weight = decay_weight_full[:B]
             result[f'{domain}_decay_weight'] = torch.from_numpy(decay_weight.copy())
 
         return result
@@ -684,15 +768,13 @@ def get_pcvr_data(
     _train_kw = {}
     if num_workers > 0:
         _train_kw['persistent_workers'] = True
-        # v5.3-gpu: 增加预取因子，确保 GPU 不会等待数据
-        _train_kw['prefetch_factor'] = max(4, num_workers * 2)
-        # v5.3-gpu: 使用 spawn 方法避免 fork 的 GIL 竞争
-        # 注意：spawn 要求 dataset 可 pickle，需要测试兼容性
-        # _train_kw['multiprocessing_context'] = 'spawn'
+        _train_kw['prefetch_factor'] = 2
 
     train_loader = DataLoader(
         train_dataset, batch_size=None,
-        num_workers=num_workers, pin_memory=use_cuda, **_train_kw,
+        num_workers=num_workers, 
+        pin_memory=use_cuda,
+        **_train_kw,
     )
 
     valid_dataset = PCVRParquetDataset(
@@ -707,7 +789,8 @@ def get_pcvr_data(
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,
-        num_workers=0, pin_memory=use_cuda,
+        num_workers=0,
+        pin_memory=use_cuda,
     )
 
     logging.info(f"Parquet train: {train_rows} rows, valid: {valid_rows} rows, "
