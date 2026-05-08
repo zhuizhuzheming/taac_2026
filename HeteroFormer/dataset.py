@@ -313,6 +313,17 @@ class PCVRParquetDataset(IterableDataset):
         return sum((n + self.batch_size - 1) // self.batch_size
                    for _, _, n in self._rg_list)
 
+    def _is_valid_training_batch(self, batch_dict: Dict[str, Any]) -> bool:
+        """训练模式下，确保 batch 同时包含正样本和负样本，否则 LambdaRank 会失效"""
+        if not self.is_training:
+            return True
+        labels = batch_dict['label']
+        n_pos = labels.sum().item()
+        # 跳过全零（无正样本）或全一（无负样本）
+        if n_pos == 0 or n_pos == labels.shape[0]:
+            return False
+        return True
+
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         worker_info = torch.utils.data.get_worker_info()
         rg_list = self._rg_list
@@ -347,7 +358,8 @@ class PCVRParquetDataset(IterableDataset):
                                 buffer = []
                         else:
                             # 不满 batch_size 的直接 yield（不 shuffle）
-                            yield batch_dict
+                            if self._is_valid_training_batch(batch_dict):
+                                yield batch_dict
                 else:
                     batch_dict = self._convert_batch(batch)
                     if batch_dict is None:
@@ -360,7 +372,8 @@ class PCVRParquetDataset(IterableDataset):
                             yield from self._flush_buffer(buffer)
                             buffer = []
                     else:
-                        yield batch_dict
+                        if self._is_valid_training_batch(batch_dict):
+                            yield batch_dict
 
         if buffer:
             yield from self._flush_buffer(buffer)
@@ -410,7 +423,8 @@ class PCVRParquetDataset(IterableDataset):
                 batch[k] = v[idx]
             batch.update(non_tensor_keys)
             
-            if self.is_training and batch['label'].sum() == 0:
+            # 使用统一的校验函数
+            if not self._is_valid_training_batch(batch):
                 continue
             
             yield batch

@@ -1,4 +1,4 @@
-"""HeteroFormer training entry point for TAAC2026 — v7.1-fix."""
+"""HeteroFormer training entry point for TAAC2026 — v7.3."""
 
 import os
 import json
@@ -110,25 +110,18 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument('--shrinkage', type=float, default=0.05)
 
-    parser.add_argument('--zmlc_lambda', type=float, default=0.05,   # FIX: 0.15 -> 0.05
-                        help='Zero-Mean Logit Constraint lambda.')
-    parser.add_argument('--cross_network_layers', type=int, default=2,
-                        help='DCN-v2 style cross network layers. 0 to disable.')
+    parser.add_argument('--zmlc_lambda', type=float, default=0.05)
+    parser.add_argument('--cross_network_layers', type=int, default=2)
 
-    parser.add_argument('--gse_num_codes', type=int, default=64,
-                        help='VQ codebook size per sequence domain')
-    parser.add_argument('--gse_code_dim', type=int, default=64,
-                        help='Dimension of each VQ code')
-    parser.add_argument('--gse_num_layers', type=int, default=4,
-                        help='Number of transformer layers inside GSE')
-    parser.add_argument('--gse_aux_weight', type=float, default=0.3,  # FIX: 0.5 -> 0.3
-                        help='Weight for GSE auxiliary losses')
+    parser.add_argument('--gse_num_codes', type=int, default=64)
+    parser.add_argument('--gse_code_dim', type=int, default=64)
+    parser.add_argument('--gse_num_layers', type=int, default=4)
+    parser.add_argument('--gse_aux_weight', type=float, default=0.3)
 
-    parser.add_argument('--compile_backend', type=str, default='inductor',
-                        help='torch.compile backend')
-    parser.add_argument('--compile_mode', type=str, default='reduce-overhead',
-                        help='torch.compile mode')
+    parser.add_argument('--compile_backend', type=str, default='inductor')
+    parser.add_argument('--compile_mode', type=str, default='reduce-overhead')
     parser.add_argument('--compile_dynamic', action='store_true', default=True)
+    parser.add_argument('--no-compile_dynamic', dest='compile_dynamic', action='store_false')
     parser.add_argument('--compile_suppress_errors', action='store_true', default=True)
 
     parser.add_argument('--focal_alpha_pos', type=float, default=0.6)
@@ -138,6 +131,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--ece_weight', type=float, default=0.05)
     parser.add_argument('--lambdarank_weight', type=float, default=0.1)
     parser.add_argument('--global_ctr', type=float, default=0.01)
+
+    # NEW: v7.3 collaborative optimization parameters
+    parser.add_argument('--zmlc_on_calib_only', action='store_true', default=True,
+                        help='ZMLC only constrains calibration residual (recommended)')
+    parser.add_argument('--rank_lr_multiplier', type=float, default=2.0,
+                        help='Learning rate multiplier for rank head')
+    parser.add_argument('--calib_lr_multiplier', type=float, default=1.0,
+                        help='Learning rate multiplier for calibrator')
+    parser.add_argument('--enable_grad_conflict_check', action='store_true', default=True,
+                        help='Enable gradient conflict detection and resolution')
+    parser.add_argument('--loss_conflict_threshold', type=float, default=0.8,
+                        help='Cosine similarity threshold for gradient conflict')
 
     args = parser.parse_args()
 
@@ -245,6 +250,9 @@ def main() -> None:
         "gse_num_codes": args.gse_num_codes,
         "gse_code_dim": args.gse_code_dim,
         "gse_num_layers": args.gse_num_layers,
+        # NEW: v7.3 params
+        "rank_head_hidden_dim": args.d_model,
+        "calib_residual_scale": 0.1,
     }
 
     model = PCVRHeteroFormer(**model_args).to(args.device)
@@ -258,9 +266,9 @@ def main() -> None:
         try:
             compile_kwargs = {
                 "backend": args.compile_backend, 
-                "fullgraph": False,          # 绝对不要 True，对动态形状不友好
-                "dynamic": args.compile_dynamic,             # 允许可变长度序列
-                "mode": args.compile_mode,   # 或 "default"，避免 max-autotune
+                "fullgraph": False,
+                "dynamic": args.compile_dynamic,
+                "mode": args.compile_mode,
             }
             model = torch.compile(model, **compile_kwargs)
             logging.info(f"torch.compile enabled (conservative): {compile_kwargs}")
@@ -271,10 +279,13 @@ def main() -> None:
     emb_params = sum(p.numel() for n, p in model.named_parameters() 
                      if 'embedding' in n or 'emb' in n.lower())
     dense_params = total_params - emb_params
+    rank_params = sum(p.numel() for n, p in model.named_parameters() if 'rank_' in n or 'rank_predictor' in n)
+    calib_params = sum(p.numel() for n, p in model.named_parameters() if 'calibrator' in n)
     
-    logging.info(f"PCVRHeteroFormer v7.1-fix (NaN-Root-Cause)")
+    logging.info(f"PCVRHeteroFormer v7.3 (Collaborative Multi-Objective)")
     logging.info(f"GSE config: num_codes={args.gse_num_codes}, code_dim={args.gse_code_dim}, layers={args.gse_num_layers}")
     logging.info(f"Total parameters: {total_params:,} | Embedding: {emb_params:,} | Dense: {dense_params:,}")
+    logging.info(f"Rank head: {rank_params:,} | Calibrator: {calib_params:,}")
     
     if args.base_rank is not None and args.base_rank < args.d_model // 2:
         logging.warning(
@@ -284,6 +295,7 @@ def main() -> None:
     logging.info(f"Embedding/Dense ratio: {emb_params/max(dense_params,1):.1f}")
     logging.info(f"Rank schedule: {model.ranks}")
     logging.info(f"Shrinkage: {args.shrinkage}")
+    logging.info(f"ZMLC mode: {'calib_only' if args.zmlc_on_calib_only else 'full_logits'}")
 
     early_stopping = EarlyStopping(
         checkpoint_path=os.path.join(args.ckpt_dir, "placeholder", "model.pt"),
@@ -337,6 +349,13 @@ def main() -> None:
         ece_weight=args.ece_weight,
         lambdarank_weight=args.lambdarank_weight,
         global_ctr=args.global_ctr,
+        zmlc_lambda=args.zmlc_lambda,
+        # NEW: v7.3 collaborative params
+        zmlc_on_calib_only=args.zmlc_on_calib_only,
+        rank_lr_multiplier=args.rank_lr_multiplier,
+        calib_lr_multiplier=args.calib_lr_multiplier,
+        enable_grad_conflict_check=args.enable_grad_conflict_check,
+        loss_conflict_threshold=args.loss_conflict_threshold,
     )
 
     trainer.train()

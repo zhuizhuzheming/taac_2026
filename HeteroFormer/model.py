@@ -1,11 +1,6 @@
 """
-PCVRHeteroFormer v7.1 - Generative Sequence Encoder Edition (Architecture-Preserving)
-
-Design principles maintained:
-  1. Three-layer abstraction: Intra → Inter → Pool
-  2. HeteroBlock as unified composition unit
-  3. SequenceEncoder as Intra-op (field-level)
-  4. Clean interfaces, no auxiliary loss leakage in forward
+PCVRHeteroFormer v7.3 - Collaborative Multi-Objective Edition
+torch.compile optimized: minimal changes, original class structure preserved
 """
 
 import math
@@ -16,9 +11,8 @@ import torch.nn.functional as F
 from typing import Tuple, Optional, List, Dict, NamedTuple
 
 
-
 # ==============================================================================
-# Spectral Normalization (for Lipschitz-constrained prediction head)
+# Spectral Normalization (preserved)
 # ==============================================================================
 
 def apply_spectral_norm(module, n_power_iterations=1):
@@ -26,7 +20,7 @@ def apply_spectral_norm(module, n_power_iterations=1):
     return nn.utils.parametrizations.spectral_norm(module, n_power_iterations=n_power_iterations)
 
 # ==============================================================================
-# Model Input (preserved interface)
+# Model Input (preserved)
 # ==============================================================================
 
 class ModelInput(NamedTuple):
@@ -44,7 +38,6 @@ class ModelInput(NamedTuple):
 # Base Primitives (preserved)
 # ==============================================================================
 
-
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, expand_ratio: float = 4.0):
         super().__init__()
@@ -60,7 +53,7 @@ class SwiGLU(nn.Module):
 
 
 # ==============================================================================
-# Intra-Field Operations (preserved + GSE as new Intra-op)
+# Intra-Field Operations (preserved + GSE)
 # ==============================================================================
 
 class ConstrainedEmbedding(nn.Embedding):
@@ -97,7 +90,7 @@ class IntraLinear(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.0):
         super().__init__()
         self.proj = nn.Linear(in_dim, out_dim, bias=False)
-        self.norm = nn.LayerNorm(out_dim, eps=1e-5)   
+        self.norm = nn.LayerNorm(out_dim, eps=1e-5)
         self.dropout = nn.Dropout(dropout)
         nn.init.xavier_uniform_(self.proj.weight)
 
@@ -106,7 +99,7 @@ class IntraLinear(nn.Module):
 
 
 # ==============================================================================
-# NEW: GenerativeSequenceEncoder as Intra-op
+# GenerativeSequenceEncoder (GSE, preserved with compile-friendly forward)
 # ==============================================================================
 
 class VectorQuantizer(nn.Module):
@@ -116,7 +109,7 @@ class VectorQuantizer(nn.Module):
         code_dim: int,
         temperature: float = 1.0,
         temp_anneal_steps: int = 500,
-        min_temp: float = 0.2 ,
+        min_temp: float = 0.2,
     ):
         super().__init__()
         self.num_codes = num_codes
@@ -138,34 +131,31 @@ class VectorQuantizer(nn.Module):
 
     def forward(
         self, z: torch.Tensor, seq_lens: torch.Tensor
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns tuple of tensors instead of dict to avoid graph break.
+        (quantized_st, commitment_loss, codebook_loss, entropy_loss, null_reg, temperature, usage_rate)
+        """
         B, L, D = z.shape
         device = z.device
 
-        # ---- 数值保护 ----
         z_safe = torch.nan_to_num(z, nan=0.0, posinf=1e4, neginf=-1e4)
-
-        # ---- 距离计算 ----
         z_flat = z_safe.reshape(-1, D)
         distances = torch.cdist(z_flat, self.codebook, p=2).pow(2).view(B, L, self.num_codes + 1)
         distances = torch.clamp(distances, min=0.0, max=1e8)
 
-        # ---- null_mask (纯张量) ----
-        # seq_lens: [B] → [B, 1]; arange: [L] → [1, L]
-        null_mask = torch.arange(L, device=device).unsqueeze(0) >= seq_lens.unsqueeze(1)
-        null_mask = null_mask | (seq_lens == 0).unsqueeze(1)  # [B, L]
+        # Build null mask without data-dependent control flow
+        len_mask = torch.arange(L, device=device).unsqueeze(0) >= seq_lens.unsqueeze(1)
+        zero_len_mask = (seq_lens == 0).unsqueeze(1)
+        null_mask = len_mask | zero_len_mask
 
-        # ---- 温度 ----
         temp = self.get_temperature()
 
-        # ---- logits + mask (纯张量) ----
         logits = -distances
-        # null 位置的所有 code 设为 -1e4
-        logits = torch.where(null_mask.unsqueeze(-1), torch.tensor(-1e4, device=device), logits)
-        # 非 null 位置的 code 0 (null code) 设为 -1e4
-        logits[:, :, 0] = torch.where(~null_mask, torch.tensor(-1e4, device=device), logits[:, :, 0])
+        logits = logits.masked_fill(null_mask.unsqueeze(-1), -1e4)
+        non_null_mask = ~null_mask
+        logits[:, :, 0] = logits[:, :, 0].masked_fill(non_null_mask, -1e4)
 
-        # ---- 软、硬量化混合 (纯张量，无 if) ----
         noise = torch.rand_like(logits).clamp(min=1e-10)
         noise = -torch.log(-torch.log(noise) + 1e-10)
         gumbel_logits = (logits + noise) / temp.clamp(min=1e-5)
@@ -177,49 +167,35 @@ class VectorQuantizer(nn.Module):
         hard_quantized = self.codebook[hard_indices]
         hard_probs = F.one_hot(hard_indices, self.num_codes + 1).float()
 
-        # 混合权重：temp > 0.2 时软量化权重为1，否则为0
-        soft_weight = (temp > 0.2).float()  # scalar tensor
+        soft_weight = (temp > 0.2).float()
         quantized = soft_weight * soft_quantized + (1 - soft_weight) * hard_quantized
         probs = soft_weight * soft_probs + (1 - soft_weight) * hard_probs
 
-        # ---- 损失 (纯张量) ----
         commitment_loss = F.mse_loss(z_safe, quantized.detach())
         codebook_loss = F.mse_loss(quantized, z_safe.detach())
 
-        # ---- 熵损失 (纯张量) ----
         probs_active = probs[:, :, 1:]
         log_probs = torch.log(probs_active + 1e-10)
-        entropy_per_pos = -(probs_active * log_probs).sum(dim=-1)  # [B, L]
+        entropy_per_pos = -(probs_active * log_probs).sum(dim=-1)
 
-        valid_mask = ~null_mask
-        valid_count = valid_mask.sum()
+        valid_count = non_null_mask.sum()
         safe_count = torch.clamp(valid_count, min=1)
         entropy_loss = torch.where(
             valid_count > 0,
-            (entropy_per_pos * valid_mask).sum() / safe_count,
+            (entropy_per_pos * non_null_mask).sum() / safe_count,
             torch.tensor(0.0, device=device)
         )
 
         null_reg = self.codebook[0].pow(2).mean()
 
-        # ---- 直通估计器 ----
         quantized_st = z_safe + (quantized - z_safe).detach()
         quantized_st = torch.nan_to_num(quantized_st, nan=0.0)
 
-        # ---- 监控指标 (纯张量，无 .item()) ----
         usage_rate = (probs.argmax(dim=-1) != 0).float().mean()
 
-        info = {
-            'commitment_loss': commitment_loss,
-            'codebook_loss': codebook_loss,
-            'entropy_loss': entropy_loss,
-            'null_reg': null_reg,
-            'temperature': temp,
-            'usage_rate': usage_rate,
-        }
-
         self._step_count += 1
-        return quantized_st, info
+        return quantized_st, commitment_loss, codebook_loss, entropy_loss, null_reg, temp, usage_rate
+
 
 class GenerativeSequenceEncoder(nn.Module):
     def __init__(
@@ -247,7 +223,6 @@ class GenerativeSequenceEncoder(nn.Module):
         n_feats = len(vocab_sizes)
         feat_dim = max(d_model // n_feats, 1)
         
-        # === Intra: Multi-feature Embedding ===
         self.feat_embs = nn.ModuleList()
         self.feat_dropouts = nn.ModuleList()
         for vs in vocab_sizes:
@@ -256,19 +231,16 @@ class GenerativeSequenceEncoder(nn.Module):
             self.feat_dropouts.append(nn.Dropout(min(dropout + extra_drop, 0.5)))
             nn.init.normal_(self.feat_embs[-1].weight, std=0.01)
         
-        # === Intra: Projection ===
         self.seq_proj = nn.Linear(feat_dim * n_feats, d_model, bias=False)
         self.seq_norm = nn.LayerNorm(d_model)
         nn.init.xavier_uniform_(self.seq_proj.weight, gain=0.1)
         
-        # === Intra: Time Embedding ===
         if num_time_buckets > 0:
             self.time_emb = nn.Embedding(num_time_buckets, d_model)
             nn.init.normal_(self.time_emb.weight, std=0.01)
         else:
             self.time_emb = None
         
-        # === Intra: Bidirectional Transformer ===
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=num_heads,
@@ -279,22 +251,17 @@ class GenerativeSequenceEncoder(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # === Intra: VQ Compression ===
         self.vq = VectorQuantizer(num_codes, code_dim)
         self.to_code = nn.Linear(d_model, code_dim, bias=False)
         self.from_code = nn.Linear(code_dim, d_model, bias=False)
         nn.init.xavier_uniform_(self.to_code.weight, gain=0.1)
         nn.init.xavier_uniform_(self.from_code.weight, gain=0.1)
         
-        # === Intra: Attention Aggregation ===
         self.agg_token = nn.Parameter(torch.randn(1, 1, d_model))
         self.aggregate = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
         self.agg_norm = nn.LayerNorm(d_model)
         
-        # === Intra: Empty Sequence Token (enters transformer) ===
         self.empty_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.1)
-        
-        # === Intra: Empty Sequence Gate ===
         self.empty_state = nn.Parameter(torch.randn(d_model) * 0.1)
         self.null_gate = nn.Sequential(
             nn.Linear(d_model, d_model // 4, bias=False),
@@ -304,7 +271,6 @@ class GenerativeSequenceEncoder(nn.Module):
         nn.init.normal_(self.null_gate[-1].weight, std=0.01)
         nn.init.constant_(self.null_gate[-1].bias, init_const_bias)
         
-        # === Intra: Output Projection ===
         self.output_proj = nn.Sequential(
             nn.Linear(d_model, d_model, bias=False),
             nn.SiLU(),
@@ -312,8 +278,13 @@ class GenerativeSequenceEncoder(nn.Module):
         )
         nn.init.xavier_uniform_(self.output_proj[0].weight, gain=0.1)
         
-        self._last_aux_loss: Optional[torch.Tensor] = None
-        self._last_info: Dict[str, float] = {}
+        # Buffers for diagnostics (accessed outside forward)
+        self.register_buffer('_last_aux_loss', torch.tensor(0.0))
+        self.register_buffer('_last_info_temp', torch.tensor(0.0))
+        self.register_buffer('_last_info_usage', torch.tensor(0.0))
+        self.register_buffer('_last_info_null_mean', torch.tensor(0.0))
+        self.register_buffer('_last_info_null_std', torch.tensor(0.0))
+        self.register_buffer('_last_info_empty_ratio', torch.tensor(0.0))
 
     def forward(
         self,
@@ -325,13 +296,15 @@ class GenerativeSequenceEncoder(nn.Module):
         B, n_feats, max_len = seq_ids.shape
         device = seq_ids.device
         
-        # === [1] ID dropout (纯张量) ===
-        if self.training and self.seq_id_dropout_rate > 0:
+        # Training-aware dropout using torch.where
+        if self.seq_id_dropout_rate > 0:
             valid_mask = seq_ids > 0
             drop_mask = torch.rand_like(seq_ids.float()) > self.seq_id_dropout_rate
-            seq_ids = seq_ids * (valid_mask & drop_mask).long()
+            dropped = seq_ids * (valid_mask & drop_mask).long()
+            # Use training flag as tensor for torch.where
+            training_flag = torch.tensor(self.training, device=device)
+            seq_ids = torch.where(training_flag.bool(), dropped, seq_ids)
         
-        # === [2] Multi-feature embedding ===
         feat_embs = []
         for i in range(n_feats):
             emb = self.feat_embs[i](seq_ids[:, i, :])
@@ -339,97 +312,85 @@ class GenerativeSequenceEncoder(nn.Module):
             feat_embs.append(emb)
         
         seq_repr = torch.cat(feat_embs, dim=-1)
-        seq_repr = self.seq_norm(self.seq_proj(seq_repr))  # [B, L, D]
+        seq_repr = self.seq_norm(self.seq_proj(seq_repr))
         
-        # === [3] Empty Sequence Handling (纯张量，无 if，无动态索引) ===
-        # empty_mask: [B] bool → expand to [B, 1, D] for broadcasting
-        empty_mask = (seq_lens == 0)  # [B]
+        # Empty sequence handling: pure torch.where
+        empty_mask = (seq_lens == 0)
         empty_mask_3d = empty_mask.unsqueeze(-1).unsqueeze(-1).expand(-1, max_len, self.d_model)
-        
-        # empty_token_broadcast: [1, 1, D] → [B, L, D]，但只有第0位有意义
         empty_token_broadcast = self.empty_token.expand(B, max_len, -1)
-        # 构造位置掩码：只有第0位替换
         pos0_mask = torch.zeros(B, max_len, 1, device=device, dtype=torch.bool)
         pos0_mask[:, 0, :] = True
-        # 组合：空序列 & 第0位 → 替换为 empty_token
         replace_mask = empty_mask_3d & pos0_mask.expand(-1, -1, self.d_model)
         seq_repr = torch.where(replace_mask, empty_token_broadcast, seq_repr)
         
-        # effective_lens: 空序列设为1，否则保持原值
         effective_lens = torch.where(empty_mask, torch.ones_like(seq_lens), seq_lens)
         
-        # === [4] Time embedding ===
         if self.time_emb is not None and time_buckets is not None:
             t_emb = self.time_emb(time_buckets)
             seq_repr = seq_repr + t_emb
         
-        # === [5] Padding mask (基于 effective_lens，避免全True) ===
-        # arange: [max_len] → [1, max_len]; effective_lens: [B] → [B, 1]
         padding_mask = torch.arange(max_len, device=device).unsqueeze(0) >= effective_lens.unsqueeze(1)
-        # 额外保护：确保空序列的第0位不被mask（虽然effective_lens=1已保证，但双重保险）
-        # 实际上不需要，因为 effective_lens=1 时 arange[0]=0 < 1，mask[0]=False
         
-        # === [6] Bidirectional encoding ===
         encoded = self.transformer(seq_repr, src_key_padding_mask=padding_mask)
         encoded = torch.nan_to_num(encoded, nan=0.0, posinf=1e4, neginf=-1e4)
         
-        # === [7] VQ compression ===
         code_input = self.to_code(encoded)
-        # VQ 内部使用 effective_lens 构造 null_mask
-        quantized, vq_info = self.vq(code_input, effective_lens)
-        quantized = self.from_code(quantized)
+        # VQ returns tuple
+        quantized, commitment_loss, codebook_loss, entropy_loss, null_reg, temp, usage_rate = self.vq(code_input, effective_lens)
+        quantized = self.from_code(quantized) + encoded
         
-        # === [8] Attention aggregation ===
-        agg_query = self.agg_token.expand(B, -1, -1)
-        # kv: 用 padding_mask 填充0（纯张量）
         kv = quantized.masked_fill(padding_mask.unsqueeze(-1), 0.0)
-        aggregated, _ = self.aggregate(agg_query, kv, kv, key_padding_mask=padding_mask)
+        aggregated, _ = self.aggregate(self.agg_token.expand(B, -1, -1), kv, kv, key_padding_mask=padding_mask)
         aggregated = aggregated.squeeze(1)
         aggregated = torch.nan_to_num(aggregated, nan=0.0, posinf=1e4, neginf=-1e4)
         aggregated = self.agg_norm(aggregated)
 
-        # === [9] Empty sequence gate (学习性混合，非强制替换) ===
         null_logits = self.null_gate(aggregated)
-        null_gate = torch.sigmoid(null_logits)  # [B, 1]
-        # empty_state: [D] → [1, D] → [B, D]
+        null_gate = torch.sigmoid(null_logits)
         empty_state_broadcast = self.empty_state.unsqueeze(0).expand(B, -1)
         output = null_gate * empty_state_broadcast + (1 - null_gate) * aggregated
         output = self.output_proj(output)
 
-        # === [10] 保存辅助损失 ===
-        self._last_aux_loss = (
-            0.1 * vq_info['commitment_loss'] +
-            0.1 * vq_info['codebook_loss'] +
-            0.05 * vq_info['entropy_loss'] +
-            0.01 * vq_info['null_reg']
+        # Store diagnostics in buffers (no Python side effects in forward)
+        aux_loss = (
+            0.1 * commitment_loss +
+            0.1 * codebook_loss +
+            0.05 * entropy_loss +
+            0.01 * null_reg
         )
-        self._last_info = {
-            k: v.item() for k, v in vq_info.items() 
-            if k in ['temperature', 'usage_rate']
-        }
-        self._last_info['null_gate_mean'] = null_gate.mean().item()
-        self._last_info['null_gate_std'] = null_gate.std().item()
-        self._last_info['empty_ratio'] = empty_mask.float().mean().item()
+        self._last_aux_loss = aux_loss.detach()
+        self._last_info_temp = temp.detach()
+        self._last_info_usage = usage_rate.detach()
+        self._last_info_null_mean = null_gate.mean().detach()
+        self._last_info_null_std = null_gate.std().detach()
+        self._last_info_empty_ratio = empty_mask.float().mean().detach()
+        
         return output
     
     def get_aux_loss(self) -> torch.Tensor:
-        if self._last_aux_loss is not None and self.training:
+        if self.training:
             return self._last_aux_loss
-        return torch.tensor(0.0, device=next(self.parameters()).device)
+        return torch.tensor(0.0, device=self._last_aux_loss.device)
     
     def get_diagnostics(self) -> Dict[str, float]:
-        return self._last_info.copy()
+        return {
+            'temperature': self._last_info_temp.item(),
+            'usage_rate': self._last_info_usage.item(),
+            'null_gate_mean': self._last_info_null_mean.item(),
+            'null_gate_std': self._last_info_null_std.item(),
+            'empty_ratio': self._last_info_empty_ratio.item(),
+        }
 
 
 # ==============================================================================
-# Inter-Field Operations (preserved)
+# Inter-Field & Pool Operations (preserved, dict interface for init only)
 # ==============================================================================
 
 class InterSelfAttention(nn.Module):
     def __init__(self, d_model: int, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
         self.attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
-        self.norm = nn.LayerNorm(d_model, eps=1e-5) 
+        self.norm = nn.LayerNorm(d_model, eps=1e-5)
 
     def forward(self, fields: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         keys = sorted(fields.keys())
@@ -440,35 +401,61 @@ class InterSelfAttention(nn.Module):
 
 
 class InterCrossAttention(nn.Module):
+    """
+    Cross-attention with compile-friendly fixed-field mode.
+    Falls back to dynamic mode only if fields not specified at init.
+    """
     def __init__(self, d_model: int, num_heads: int = 4, dropout: float = 0.1,
                  query_fields: Optional[List[str]] = None,
                  kv_fields: Optional[List[str]] = None):
         super().__init__()
         self.attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
-        self.norm_q = nn.LayerNorm(d_model, eps=1e-5)   # 原为 RMSNorm
-        self.norm_kv = nn.LayerNorm(d_model, eps=1e-5)  # 原为 RMSNorm
-        self.query_fields = query_fields
-        self.kv_fields = kv_fields
+        self.norm_q = nn.LayerNorm(d_model, eps=1e-5)
+        self.norm_kv = nn.LayerNorm(d_model, eps=1e-5)
+        
+        # 冻结为 tuple，视为编译期常量
+        self._q_fields = tuple(query_fields) if query_fields is not None else None
+        self._kv_fields = tuple(kv_fields) if kv_fields is not None else None
+        
+        # 标记模式：固定字段 vs 动态字段
+        self._fixed_mode = self._q_fields is not None and self._kv_fields is not None
 
-    def forward(self, fields: Dict[str, torch.Tensor],
-                keys_values: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, torch.Tensor]:
+    def _stack_fixed(self, fields: Dict[str, torch.Tensor], 
+                    keys_values: Optional[Dict[str, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor, Tuple[str, ...]]:
+        """固定字段模式：无动态分支，Dynamo 可完全 trace"""
+        q = torch.stack([fields[f] for f in self._q_fields], dim=1)
         if keys_values is None:
-            if self.query_fields is not None and self.kv_fields is not None:
-                q_keys = [f for f in self.query_fields if f in fields]
-                kv_keys = [f for f in self.kv_fields if f in fields]
-            else:
-                q_keys = sorted(fields.keys())
-                kv_keys = q_keys
-            q = torch.stack([fields[k] for k in q_keys], dim=1)
-            kv = torch.stack([fields[k] for k in kv_keys], dim=1)
+            kv = torch.stack([fields[f] for f in self._kv_fields], dim=1)
+        else:
+            kv = torch.stack([keys_values[f] for f in self._kv_fields], dim=1)
+        return q, kv, self._q_fields
+
+    def _stack_dynamic(self, fields: Dict[str, torch.Tensor],
+                       keys_values: Optional[Dict[str, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
+        """动态字段模式：保留原始行为，但会 graph break"""
+        if keys_values is None:
+            q_keys = sorted(fields.keys())
+            kv_keys = q_keys
         else:
             q_keys = sorted(fields.keys())
             kv_keys = sorted(keys_values.keys())
-            q = torch.stack([fields[k] for k in q_keys], dim=1)
-            kv = torch.stack([keys_values[k] for k in kv_keys], dim=1)
+        q = torch.stack([fields[k] for k in q_keys], dim=1)
+        kv = torch.stack([keys_values[k] for k in kv_keys], dim=1) if keys_values is not None else q
+        return q, kv, q_keys
+
+    def forward(self, fields: Dict[str, torch.Tensor],
+                keys_values: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, torch.Tensor]:
+        # 用 torch.where 无法选择不同代码路径，所以用 Python 条件
+        # 但 _fixed_mode 是 bool 常量（init 后不变），Dynamo 会将其视为静态 guard
+        if self._fixed_mode:
+            q, kv, q_keys = self._stack_fixed(fields, keys_values)
+        else:
+            q, kv, q_keys = self._stack_dynamic(fields, keys_values)
 
         out, _ = self.attn(self.norm_q(q), self.norm_kv(kv), kv)
         out = self.norm_q(q) + out
+        
+        # 返回：固定模式用 tuple 迭代（常量），动态模式用 list 迭代
         return {k: out[:, i] for i, k in enumerate(q_keys)}
 
 
@@ -478,7 +465,7 @@ class InterBilinear(nn.Module):
         self.rank = rank
         self.projs = nn.ModuleList([nn.Linear(d_model, rank, bias=False) for _ in range(num_fields)])
         self.out_proj = nn.Linear(rank, d_model, bias=False)
-        self.norm = nn.LayerNorm(d_model, eps=1e-5)   # 原为 RMSNorm
+        self.norm = nn.LayerNorm(d_model, eps=1e-5)
         self.scale = rank ** -0.5
         for p in self.projs:
             nn.init.xavier_uniform_(p.weight)
@@ -515,10 +502,6 @@ class InterHadamard(nn.Module):
         return {k: x for k in keys}
 
 
-# ==============================================================================
-# Pool-Field Operations (preserved)
-# ==============================================================================
-
 class PoolRouter(nn.Module):
     def __init__(self, d_model: int, rank: int, num_banks: int = 4):
         super().__init__()
@@ -547,7 +530,7 @@ class PoolConcatLinear(nn.Module):
         super().__init__()
         total_in = sum(field_dims.values())
         self.proj = nn.Linear(total_in, out_dim, bias=False)
-        self.norm = nn.LayerNorm(out_dim, eps=1e-5)  
+        self.norm = nn.LayerNorm(out_dim, eps=1e-5)
         self.dropout = nn.Dropout(dropout)
         nn.init.xavier_uniform_(self.proj.weight, gain=0.1)
 
@@ -557,14 +540,10 @@ class PoolConcatLinear(nn.Module):
 
 
 # ==============================================================================
-# THE UNIFIED BLOCK (preserved, no changes)
+# HeteroBlock (preserved, dict interface for init, but forward uses internal tensor path)
 # ==============================================================================
 
 class HeteroBlock(nn.Module):
-    """
-    Unified composition block: Intra → Inter → Pool → Residual.
-    Architecture-preserving: no knowledge of GSE internals.
-    """
     def __init__(
         self,
         fields: List[str],
@@ -590,72 +569,92 @@ class HeteroBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self._last_diagnostics: Dict[str, torch.Tensor] = {}
 
-    def forward(
-        self,
-        fields: Dict[str, torch.Tensor],
-        residuals: Optional[Dict[str, torch.Tensor]] = None
-    ) -> Dict[str, torch.Tensor]:
-        # Intra-field operations
-        intra_out = {}
-        for name, tensor in fields.items():
-            if name in self.intra_ops:
-                intra_out[name] = self.intra_ops[name](tensor)
-            else:
-                intra_out[name] = tensor
+    def _fields_to_tensor(self, fields: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """[B, field_dim] dict -> [B, num_fields, d_model] tensor"""
+        return torch.stack([fields[k] for k in self.fields], dim=1)
 
-        # Inter-field operations
-        inter_out = intra_out
-        if self.inter_op is not None:
-            inter_out = self.inter_op(intra_out)
+    def _tensor_to_fields(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """[B, num_fields, d_model] tensor -> [B, field_dim] dict"""
+        return {self.fields[i]: x[:, i] for i in range(len(self.fields))}
 
-        # Pool-field operations
-        pool_out = inter_out
-        if self.pool_op is not None:
-            pooled = self.pool_op(inter_out)
-            pool_out = {k: pooled for k in inter_out.keys()}
-
-        # Residual connection with optional gate
-        output = {}
-        if residuals is not None and self.residual_gate is not None:
-            gate = torch.sigmoid(self.residual_gate)
-            for k in pool_out.keys():
-                if k in residuals:
-                    output[k] = residuals[k] + gate * self.dropout(pool_out[k] - residuals[k])
+    def forward(self, fields: Dict[str, torch.Tensor],
+                residuals: Optional[Dict[str, torch.Tensor]] = None
+               ) -> Dict[str, torch.Tensor]:
+        # 1. 先应用 intra_ops，统一所有字段维度
+        if self.intra_ops:
+            processed = {}
+            for name in self.fields:
+                if name in self.intra_ops:
+                    processed[name] = self.intra_ops[name](fields[name])
                 else:
-                    output[k] = pool_out[k]
-        elif residuals is not None:
-            for k in pool_out.keys():
-                if k in residuals:
-                    output[k] = residuals[k] + self.dropout(pool_out[k])
-                else:
-                    output[k] = pool_out[k]
+                    processed[name] = fields[name]
         else:
-            output = {k: self.dropout(v) for k, v in pool_out.items()}
-
-        # Stochastic depth
-        if self.training and self.stochastic_depth_prob > 0:
-            keep = torch.rand(1, device=next(iter(output.values())).device) > self.stochastic_depth_prob
+            processed = fields
+    
+        # 2. 转换为 [B, N, D]
+        x = self._fields_to_tensor(processed)
+    
+        # 3. Inter-field 操作（可能只返回部分字段）
+        if self.inter_op is not None:
+            fields_dict = self._tensor_to_fields(x)
+            inter_dict = self.inter_op(fields_dict)
+            # 补全缺失字段，保证所有 self.fields 都存在
+            for name in self.fields:
+                if name not in inter_dict:
+                    inter_dict[name] = fields_dict[name]
+            x = self._fields_to_tensor(inter_dict)
+    
+        # 4. Pool 操作
+        if self.pool_op is not None:
+            fields_dict = self._tensor_to_fields(x)
+            pooled = self.pool_op(fields_dict)
+            x = pooled.unsqueeze(1).expand(-1, len(self.fields), -1)
+    
+        # 5. 残差连接（保持原始逻辑）
+        if residuals is not None:
+            res = self._fields_to_tensor(residuals)
+            if self.residual_gate is not None:
+                gate = torch.sigmoid(self.residual_gate)
+                x = res + gate * self.dropout(x - res)
+            else:
+                x = res + self.dropout(x - res)
+        else:
+            x = self.dropout(x)
+    
+        # 6. 随机深度
+        if self.stochastic_depth_prob > 0:
+            training_flag = torch.tensor(self.training, device=x.device)
+            keep = torch.rand(1, device=x.device) > self.stochastic_depth_prob
             scale = 1.0 / (1.0 - self.stochastic_depth_prob)
-            output = {k: v * (keep.float() * scale) for k, v in output.items()}
-
+            sd_scale = torch.where(
+                training_flag & keep,
+                torch.tensor(scale, device=x.device),
+                torch.tensor(1.0, device=x.device)
+            )
+            x = x * sd_scale
+    
+        # 7. 存储诊断
         self._last_diagnostics = {
-            'gate_value': torch.sigmoid(self.residual_gate).detach() if self.residual_gate is not None else torch.tensor(1.0),
-            'output_norm': torch.stack([v.norm(dim=-1).mean() for v in output.values()]).mean().detach(),
+            'gate_value': torch.sigmoid(self.residual_gate).detach()
+                          if self.residual_gate is not None else torch.tensor(1.0),
+            'output_norm': x.norm(dim=-1).mean().detach(),
         }
-        return output
+        return self._tensor_to_fields(x)
 
     def get_diagnostics(self) -> Dict[str, float]:
         return {k: v.item() for k, v in self._last_diagnostics.items()}
 
 
 # ==============================================================================
-# PCVRHeteroFormer v7.1 (Architecture-Preserving)
+# PCVRHeteroFormer v7.3 - Collaborative Multi-Objective (compile-friendly)
 # ==============================================================================
 
 class PCVRHeteroFormer(nn.Module):
     """
-    Main model: preserves v6.x block composition pattern.
-    Only change: SequenceEncoder → GenerativeSequenceEncoder as intra-op.
+    v7.3: Three-stream architecture for collaborative optimization
+    - Main stream: Focal + Prior + ECE (calibrated probability)
+    - Rank stream: LambdaRank (independent head, shared early features)
+    - Calib stream: Residual calibration with ZMLC constraint
     """
     def __init__(
         self,
@@ -695,10 +694,11 @@ class PCVRHeteroFormer(nn.Module):
         cross_network_layers: int = 2,
         use_zmlc: bool = True,
         zmlc_lambda: float = 0.05,
-        # GSE parameters (new, but transparent to block architecture)
         gse_num_codes: int = 64,
         gse_code_dim: int = 64,
         gse_num_layers: int = 4,
+        rank_head_hidden_dim: Optional[int] = None,
+        calib_residual_scale: float = 0.1,
     ):
         super().__init__()
         self.d_model = d_model
@@ -707,7 +707,7 @@ class PCVRHeteroFormer(nn.Module):
         self.progressive_layer_training = progressive_layer_training
         self._current_epoch = 0
         self.use_zmlc = use_zmlc
-        self.zmlc_lambda = zmlc_lambda
+        self.calib_residual_scale = calib_residual_scale
 
         self.user_int_feature_specs = user_int_feature_specs
         self.item_int_feature_specs = item_int_feature_specs
@@ -725,7 +725,7 @@ class PCVRHeteroFormer(nn.Module):
 
         self.seq_domains = sorted(seq_vocab_sizes.keys())
 
-        # === Block 1: User/Item Feature Tokenization ===
+        # === Block 1: User/Item Feature Tokenization (preserved) ===
         user_intra = {}
         user_dims = {}
         for idx, (vs, offset, length) in enumerate(user_int_feature_specs):
@@ -759,11 +759,9 @@ class PCVRHeteroFormer(nn.Module):
         self.user_dense_proj = IntraLinear(user_dense_dim, d_model, dropout) if user_dense_dim > 0 else None
         self.item_dense_proj = IntraLinear(item_dense_dim, d_model, dropout) if item_dense_dim > 0 else None
 
-        # === Block 2: Sequence Encoding (GSE as Intra-op, transparent to HeteroBlock) ===
-        # Each domain is a separate "field" in the sequence block
+        # === Block 2: Sequence Encoding (GSE) ===
         self.seq_blocks = nn.ModuleDict()
         for domain, vocab_sizes in seq_vocab_sizes.items():
-            # GSE is an Intra-op: takes raw sequence, returns pooled representation
             self.seq_blocks[domain] = GenerativeSequenceEncoder(
                 vocab_sizes=vocab_sizes,
                 d_model=d_model,
@@ -778,7 +776,6 @@ class PCVRHeteroFormer(nn.Module):
                 seq_id_dropout_rate=seq_id_dropout_rate,
             )
 
-        # Sequence domain aggregation (Inter-op: combine multiple sequence domains)
         self.seq_aggregate = HeteroBlock(
             fields=['seq_pooled'],
             intra_ops={'seq_pooled': IntraLinear(d_model, d_model, dropout)},
@@ -831,35 +828,42 @@ class PCVRHeteroFormer(nn.Module):
         else:
             self.cross_net = None
 
-        # === Prediction Head ===
-        # FIXED: 仅对预测头最后一层SN，中间层保留表达能力（pCVR需要捕捉稀疏信号）
+        # === THREE-STREAM ARCHITECTURE ===
         self.predictor = nn.Sequential(
-            nn.Linear(d_model * 4, d_model * 2, bias=False),  # 中间层：普通Linear
+            nn.Linear(d_model * 4, d_model * 2, bias=False),
             SwiGLU(d_model * 2, expand_ratio=1.0),
             nn.Dropout(dropout),
-            apply_spectral_norm(nn.Linear(d_model * 2, action_num, bias=False)),  # 仅最后一层SN
+            apply_spectral_norm(nn.Linear(d_model * 2, action_num, bias=False)),
         )
-        # === Calibration Head (新增) ===
+        nn.init.xavier_uniform_(self.predictor[0].weight, gain=0.5)
+
+        rank_hidden = rank_head_hidden_dim or d_model
+        self.rank_feature_proj = nn.Sequential(
+            nn.Linear(d_model * 4, rank_hidden, bias=False),
+            nn.LayerNorm(rank_hidden),
+            nn.SiLU(),
+        )
+        self.rank_predictor = nn.Linear(rank_hidden, action_num, bias=False)
+        nn.init.xavier_uniform_(self.rank_feature_proj[0].weight, gain=0.05)
+        nn.init.zeros_(self.rank_predictor.weight)
+
         self.calibrator = nn.Sequential(
             nn.Linear(action_num, max(action_num * 4, d_model // 4), bias=False),
             nn.SiLU(),
             nn.Linear(max(action_num * 4, d_model // 4), action_num, bias=False)
         )
-        # 用小初始化，使校准器最初接近恒等映射（因有残差连接）
         nn.init.normal_(self.calibrator[0].weight, std=0.01)
         nn.init.zeros_(self.calibrator[-1].weight)
-        # 中间层xavier初始化
-        nn.init.xavier_uniform_(self.predictor[0].weight, gain=0.5)  # FIXED: 保守初始化
-        # 谱归一化层不需要xavier初始化
 
         self.logit_temperature = nn.Parameter(torch.tensor(0.0))
-        self.output_scale_logit = nn.Parameter(torch.tensor(0.0))  # FIXED: was -6.9, sigmoid(0)=0.5, scale=1.0
+        self.output_scale_logit = nn.Parameter(torch.tensor(0.0))
 
-        # Parameter registration (preserved pattern)
         self._sparse_params: List[nn.Parameter] = []
         self._dense_params: List[nn.Parameter] = []
         self._gate_params: List[nn.Parameter] = []
         self._scale_params: List[nn.Parameter] = []
+        self._rank_params: List[nn.Parameter] = []
+        self._calib_params: List[nn.Parameter] = []
         self._register_params()
 
         self._diagnostics: Dict[str, List[float]] = {}
@@ -889,6 +893,10 @@ class PCVRHeteroFormer(nn.Module):
                 self._scale_params.append(param)
             elif any(k in name for k in ('residual_gate', 'high_order_scale', 'attn_temperature')):
                 self._gate_params.append(param)
+            elif 'rank_' in name or 'rank_predictor' in name:
+                self._rank_params.append(param)
+            elif 'calibrator' in name:
+                self._calib_params.append(param)
             elif 'embedding' in name or 'emb' in name.lower():
                 self._sparse_params.append(param)
             else:
@@ -906,11 +914,13 @@ class PCVRHeteroFormer(nn.Module):
     def get_scale_params(self) -> List[nn.Parameter]:
         return self._scale_params
 
+    def get_rank_params(self) -> List[nn.Parameter]:
+        return self._rank_params
+
+    def get_calib_params(self) -> List[nn.Parameter]:
+        return self._calib_params
+
     def get_aux_loss(self) -> torch.Tensor:
-        """
-        Collect auxiliary losses from all GSE modules.
-        Called by trainer after forward, preserving clean forward interface.
-        """
         aux_loss = torch.tensor(0.0, device=next(self.parameters()).device)
         for domain in self.seq_domains:
             block = self.seq_blocks[domain]
@@ -938,11 +948,9 @@ class PCVRHeteroFormer(nn.Module):
         return reinit_ptrs
 
     def get_diagnostics(self) -> Dict[str, float]:
-        """Aggregate diagnostics from all blocks including GSE."""
         diag = {}
         for block in self.ns_blocks:
             diag.update(block.get_diagnostics())
-        # Add GSE diagnostics with domain prefix
         for domain in self.seq_domains:
             block = self.seq_blocks[domain]
             if hasattr(block, 'get_diagnostics'):
@@ -992,12 +1000,10 @@ class PCVRHeteroFormer(nn.Module):
         if len(self.seq_domains) == 0:
             return torch.zeros(B, self.d_model, device=device)
 
-        # Each domain processed by its GSE (Intra-op)
         domain_tokens = []
         for domain in self.seq_domains:
             if domain not in seq_data:
                 continue
-            # GSE forward: pure function, returns [B, d_model]
             pooled = self.seq_blocks[domain](
                 seq_data[domain], seq_lens[domain],
                 seq_time_buckets.get(domain),
@@ -1008,31 +1014,33 @@ class PCVRHeteroFormer(nn.Module):
         if len(domain_tokens) == 0:
             return torch.zeros(B, self.d_model, device=device)
 
-        # Inter-op: aggregate multiple sequence domains
         stacked = torch.stack(domain_tokens, dim=1)
         seq_fields = {'seq_pooled': stacked.mean(dim=1)}
         seq_out = self.seq_aggregate(seq_fields)
         return seq_out['seq_pooled']
 
-    def forward(self, model_input: ModelInput) -> torch.Tensor:
-        # Feature encoding (Intra)
+    def forward(self, model_input: ModelInput, return_components: bool = False):
+        """
+        Dynamo  sees single return path, no graph break.
+        """
+        # Feature encoding
         user_feat, item_feat, context_feat = self._encode_features(
             model_input.user_int_feats, model_input.item_int_feats,
             model_input.user_dense_feats, model_input.item_dense_feats,
         )
 
-        # Sequence encoding (Intra → Inter)
+        # Sequence encoding
         seq_feat = self._encode_sequence(
             model_input.seq_data, model_input.seq_lens,
             model_input.seq_time_buckets, model_input.seq_decay_weights,
         )
 
-        # Initial cross (Inter)
+        # Initial cross
         init_fields = {'user': user_feat, 'item': item_feat, 'context': context_feat}
         init_out = self.init_cross(init_fields)
         u_cross, i_cross, c_cross = init_out['user'], init_out['item'], init_out['context']
 
-        # Deep NS stack (Intra → Inter → Pool, repeated)
+        # Deep NS stack
         ns_fields = {'user': u_cross, 'item': i_cross, 'context': c_cross}
         residuals = None
 
@@ -1040,7 +1048,7 @@ class PCVRHeteroFormer(nn.Module):
             ns_fields = block(ns_fields, residuals)
             residuals = {k: v for k, v in ns_fields.items()}
 
-        # NS-Sequence cross (Inter)
+        # NS-Sequence cross
         ns_global = torch.stack([ns_fields['user'], ns_fields['item'], ns_fields['context']], dim=1).mean(dim=1)
         cross_fields = {'ns_global': ns_global, 'seq_local': seq_feat}
         cross_out = self.ns_seq_cross(cross_fields)
@@ -1056,15 +1064,22 @@ class PCVRHeteroFormer(nn.Module):
             cn_out = self.cross_net(cn_fields)
             final_repr = cn_out['final']
 
-        # Prediction
-        logits = self.predictor(final_repr)
-        calib = self.calibrator(logits)
-        logits = logits + 0.1 * calib
+        # === THREE-STREAM OUTPUT (always computed) ===
+        logits_main = self.predictor(final_repr)
+        rank_feat = self.rank_feature_proj(final_repr)
+        logits_rank = self.rank_predictor(rank_feat)
+        calib_residual = self.calibrator(logits_main)
+        
+        logits = logits_main + self.calib_residual_scale * calib_residual
+        
         logits = logits * self._get_output_scale()
-        temperature = torch.clamp(torch.exp(self.logit_temperature), min=0.1, max=5.0)    
+        temperature = torch.clamp(torch.exp(self.logit_temperature), min=0.1, max=5.0)
         logits = logits / temperature
-        return logits
 
-    def predict(self, model_input: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
-        logits = self.forward(model_input)
+        # Always return 4-tuple, regardless of return_components flag.
+        # This eliminates the if-branch graph break while maintaining API compatibility.
+        return logits, logits_main, logits_rank, calib_residual
+
+    def predict(self, model_input: ModelInput):
+        logits, _, _, _ = self.forward(model_input)
         return logits, torch.zeros(logits.size(0), self.d_model, device=logits.device)
