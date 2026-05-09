@@ -3,7 +3,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# v7.3: Collaborative Multi-Objective Edition
+# v7.4-sinkhorn: Optimal Transport + Spectral Diversity
 export TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1
 export TORCHINDUCTOR_CPP_WRAPPER=0
 export TORCHINDUCTOR_CPP_BUILDER=0
@@ -22,8 +22,12 @@ python -c "import torch; print(torch.__version__); print(torch.cuda.is_available
 rm -rf /tmp/torchinductor_$(whoami)
 find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null
 
-# ---- v7.3: Collaborative Multi-Objective Edition ----
-    # v7.3: NEW collaborative optimization params Last 4
+# 核心改变：
+# 1. Sinkhorn最优传输替代softmax：列约束强制每个原型获得最小配额
+# 2. 谱多样性正则：SVD奇异值均匀分布，几何上分散原型
+# 3. 无需温度退火、无需死原型重启（数学保证不死）
+# 4. torch.compile完全兼容
+
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_groups_json "" \
     --emb_skip_threshold 10000000 \
@@ -60,26 +64,20 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --id_vocab_threshold 10000 \
     --shrinkage 0.05 \
     --base_rank 64 \
-    --gse_num_codes 64 \
-    --gse_code_dim 64 \
-    --gse_num_layers 4 \
-    --gse_aux_weight 0.3 \
+    --cross_network_layers 2 \
     --focal_alpha_pos 0.6 \
     --focal_alpha_neg 0.4 \
     --focal_max_gamma 4.0 \
+    --global_ctr 0.01 \
     --compile_suppress_errors \
     --compile_backend aot_eager \
     --compile_mode default \
     --no-compile_dynamic \
-    --prior_weight 0.02 \
-    --ece_weight 0.02 \
-    --lambdarank_weight 0.1 \
-    --global_ctr 0.01 \
-    --zmlc_lambda 0.1 \
-    --cross_network_layers 2 \
-    --zmlc_on_calib_only \
-    --rank_lr_multiplier 2.0 \
-    --calib_lr_multiplier 2.0 \
-    --enable_grad_conflict_check \
-    --loss_conflict_threshold 0.8 \
+    --num_codes 64 \
+    --sinkhorn_epsilon 0.1 \
+    --sinkhorn_iter 20 \
+    --min_mass_ratio 0.05 \
+    --curriculum_warmup 5000 \
+    --sinkhorn_epsilon 0.05 \
+    --min_mass_ratio 0.016 \
     "$@"

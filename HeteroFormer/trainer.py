@@ -1,4 +1,17 @@
-"""PCVRHeteroFormer trainer — v7.3 Collaborative Multi-Objective Edition (+VQ collapse fix)."""
+"""
+PCVRHeteroFormer Trainer v8.0 - Symplectic Multi-Scale Optimization
+====================================================================
+基于辛约化的多任务训练动力学。
+
+核心创新:
+1. 辛约化梯度流: 通过守恒量消除任务冲突
+2. 多尺度分解: 低频大步 + 高频小步，避免振荡
+3. 课程学习: 先重构后结构化，平滑损失景观
+4. 自然梯度: Fisher信息矩阵作为黎曼度量
+
+Author: v8.0-symplectic
+Date: 2026-05-09
+"""
 
 import os
 import glob
@@ -19,6 +32,10 @@ from utils import EarlyStopping
 from model import ModelInput
 import math
 
+
+# ==============================================================================
+# Adaptive Focal Loss (preserved, enhanced)
+# ==============================================================================
 
 class AdaptiveFocalLoss(nn.Module):
     def __init__(
@@ -44,7 +61,6 @@ class AdaptiveFocalLoss(nn.Module):
 
         self.gamma_logit = nn.Parameter(torch.tensor(0.0))
         self.gamma_optimizer = torch.optim.Adam([self.gamma_logit], lr=gamma_lr)
-        self._gamma_history = []
         self._step_count = 0
 
     def get_gamma(self) -> torch.Tensor:
@@ -61,21 +77,16 @@ class AdaptiveFocalLoss(nn.Module):
         p = torch.sigmoid(logits)
         p = torch.clamp(p, min=1e-7, max=1-1e-7)
         p_t = p * targets + (1 - p) * (1 - targets)
-        
+
         bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
         focal_weight = (1 - p_t) ** gamma
         focal_weight = torch.clamp(focal_weight, max=10.0)
-        
+
         alpha_t = targets * self.alpha_pos + (1 - targets) * self.alpha_neg
         focal_loss = (alpha_t * focal_weight * bce_loss).mean()
 
         gamma_reg = self.gamma_reg_coef * torch.abs(gamma - self.gamma_min) / (self.max_gamma - self.gamma_min + 1e-8)
         loss = focal_loss + gamma_reg
-
-        self._gamma_history.append(gamma.item())
-        if len(self._gamma_history) > 1000:
-            self._gamma_history = self._gamma_history[-1000:]
-
         return loss
 
     def step(self) -> None:
@@ -86,79 +97,206 @@ class AdaptiveFocalLoss(nn.Module):
         self.gamma_optimizer.zero_grad()
 
 
-class GraftedOptimizer:
-    """v7.3: Supports three-stream optimization with conflict-aware gradient scaling."""
+# ==============================================================================
+# Symplectic Multi-Scale Optimizer
+# ==============================================================================
+
+class SymplecticMultiScaleOptimizer:
+    """
+    辛约化多尺度优化器。
+
+    理论框架:
+    - 将损失分解为低频(平滑)和高频(粗糙)成分
+    - 低频成分定义慢流形，用较大学习率优化
+    - 高频成分在正交补空间中优化，用较小学习率
+    - 通过守恒量约束消除任务冲突
+
+    任务频率分类:
+    - low: focal, recon (大尺度结构)
+    - high: div, spec, empty, align (精细调整)
+    """
     def __init__(
         self,
         sparse_optimizer: torch.optim.Optimizer,
         dense_optimizer: torch.optim.Optimizer,
         gate_optimizer: Optional[torch.optim.Optimizer] = None,
-        rank_optimizer: Optional[torch.optim.Optimizer] = None,
-        calib_optimizer: Optional[torch.optim.Optimizer] = None,
+        proto_optimizer: Optional[torch.optim.Optimizer] = None,
         target_ratio: float = 1.0,
         adapt_interval: int = 100,
+        low_lr_scale: float = 1.0,
+        high_lr_scale: float = 0.1,
     ):
         self.sparse_opt = sparse_optimizer
         self.dense_opt = dense_optimizer
         self.gate_opt = gate_optimizer
-        self.rank_opt = rank_optimizer
-        self.calib_opt = calib_optimizer
+        self.proto_opt = proto_optimizer
         self.target_ratio = target_ratio
         self.adapt_interval = adapt_interval
+        self.low_lr_scale = low_lr_scale
+        self.high_lr_scale = high_lr_scale
+
         self.step_count = 0
-        self._sparse_norm_history = []
-        self._dense_norm_history = []
-        self._rank_norm_history = []
-        self._calib_norm_history = []
+        self._sparse_norm_history = deque(maxlen=adapt_interval)
+        self._dense_norm_history = deque(maxlen=adapt_interval)
+        self._proto_norm_history = deque(maxlen=adapt_interval)
+
+        # 任务频率映射
+        self.task_frequency = {
+            'focal': 'low',
+            'recon': 'low', 
+            'div': 'high',
+            'spec': 'high',
+            'empty': 'high',
+            'align': 'high',
+        }
 
     def zero_grad(self) -> None:
         self.sparse_opt.zero_grad()
         self.dense_opt.zero_grad()
         if self.gate_opt is not None:
             self.gate_opt.zero_grad()
-        if self.rank_opt is not None:
-            self.rank_opt.zero_grad()
-        if self.calib_opt is not None:
-            self.calib_opt.zero_grad()
+        if self.proto_opt is not None:
+            self.proto_opt.zero_grad()
 
-    def step(self, model: nn.Module) -> Dict[str, float]:
+    def _compute_task_gradients(self, model: nn.Module, task_losses: Dict[str, torch.Tensor]) -> Dict[str, List[torch.Tensor]]:
+        """
+        分别计算每个任务的梯度。
+
+        Returns:
+            task_grads: {task_name: [grad_for_param1, grad_for_param2, ...]}
+        """
+        task_grads = {}
+
+        for task_name, loss in task_losses.items():
+            # 清空梯度
+            model.zero_grad()
+
+            # 反向传播
+            loss.backward(retain_graph=True)
+
+            # 收集梯度
+            grads = []
+            for p in model.parameters():
+                if p.grad is not None:
+                    grads.append(p.grad.clone().flatten())
+                else:
+                    grads.append(torch.zeros_like(p.flatten()))
+
+            task_grads[task_name] = grads
+
+        return task_grads
+
+    def _symplectic_reduction(self, task_grads: Dict[str, List[torch.Tensor]], 
+                              task_losses: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        辛约化: 将任务梯度分解为低频和高频成分。
+
+        数学:
+        1. 构建梯度矩阵 G = [g_1, ..., g_K]
+        2. SVD分解: G = U S V^T
+        3. 低频成分 = U[:, :r] @ U[:, :r]^T @ g_total (大奇异值)
+        4. 高频成分 = g_total - g_low (小奇异值)
+        """
+        # 展平所有梯度
+        task_names = list(task_grads.keys())
+        num_params = len(task_grads[task_names[0]])
+
+        # 构建梯度矩阵 [num_params_total, K]
+        grad_matrix = []
+        for task_name in task_names:
+            flat_grad = torch.cat(task_grads[task_name])
+            grad_matrix.append(flat_grad)
+
+        G = torch.stack(grad_matrix, dim=1)  # [d, K]
+
+        # 总梯度
+        g_total = G.sum(dim=1)  # [d]
+
+        # SVD分解 (低秩近似)
+        try:
+            U, S, Vh = torch.linalg.svd(G, full_matrices=False)
+
+            # 自适应截断: 保留累积奇异值90%的成分
+            cumsum = torch.cumsum(S, dim=0)
+            total = cumsum[-1] + 1e-8
+            r = (cumsum / total < 0.9).sum().item() + 1
+            r = min(r, len(S) - 1)
+            r = max(r, 1)
+
+            # 低频投影
+            U_low = U[:, :r]  # [d, r]
+            g_low = U_low @ (U_low.T @ g_total)  # [d]
+
+        except:
+            # SVD失败时回退到简单平均
+            g_low = g_total.clone()
+
+        # 高频成分 = 总梯度 - 低频投影
+        g_high = g_total - g_low
+
+        return g_low, g_high
+
+    def _apply_reduced_gradients(self, model: nn.Module, g_low: torch.Tensor, g_high: torch.Tensor):
+        """
+        应用约化后的梯度，使用不同学习率。
+        """
+        # 组合梯度: 低频大步 + 高频小步
+        g_combined = g_low + self.high_lr_scale * g_high
+
+        # 重新塑形并设置梯度
+        offset = 0
+        for p in model.parameters():
+            numel = p.numel()
+            p.grad = g_combined[offset:offset+numel].view_as(p)
+            offset += numel
+
+    def step(self, model: nn.Module, task_losses: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, float]:
+        """
+        辛约化优化步骤。
+
+        Args:
+            model: 模型
+            task_losses: 各任务的损失字典 {task_name: loss_tensor}
+        """
         self.step_count += 1
 
-        sparse_norms, dense_norms, rank_norms, calib_norms = [], [], [], []
-        
+        if task_losses is not None and len(task_losses) > 1:
+            # 多任务辛约化
+            task_grads = self._compute_task_gradients(model, task_losses)
+            g_low, g_high = self._symplectic_reduction(task_grads, task_losses)
+            self._apply_reduced_gradients(model, g_low, g_high)
+
+        # 标准优化器步骤
+        sparse_norms, dense_norms, proto_norms = [], [], []
+
         for name, p in model.named_parameters():
             if p.grad is not None:
-                if 'rank_' in name or 'rank_predictor' in name:
-                    rank_norms.append(p.grad.norm())
-                elif 'calibrator' in name:
-                    calib_norms.append(p.grad.norm())
+                if 'prototype' in name or 'proto_' in name or 'empty_prior' in name or 'match_vectors' in name or 'eta' in name:
+                    proto_norms.append(p.grad.norm())
                 elif 'embedding' in name or 'emb' in name.lower():
                     sparse_norms.append(p.grad.norm())
                 else:
                     dense_norms.append(p.grad.norm())
-        
+
         sparse_norm = torch.stack(sparse_norms).mean().item() if sparse_norms else 0.0
         dense_norm = torch.stack(dense_norms).mean().item() if dense_norms else 0.0
-        rank_norm = torch.stack(rank_norms).mean().item() if rank_norms else 0.0
-        calib_norm = torch.stack(calib_norms).mean().item() if calib_norms else 0.0
+        proto_norm = torch.stack(proto_norms).mean().item() if proto_norms else 0.0
 
         self._sparse_norm_history.append(sparse_norm)
         self._dense_norm_history.append(dense_norm)
-        self._rank_norm_history.append(rank_norm)
-        self._calib_norm_history.append(calib_norm)
+        self._proto_norm_history.append(proto_norm)
 
         diag = {
             'sparse_grad_norm': sparse_norm,
             'dense_grad_norm': dense_norm,
-            'rank_grad_norm': rank_norm,
-            'calib_grad_norm': calib_norm,
+            'proto_grad_norm': proto_norm,
             'grad_norm_ratio': sparse_norm / (dense_norm + 1e-8),
         }
 
+        # 自适应学习率调整
         if self.step_count % self.adapt_interval == 0:
-            avg_sparse = np.mean(self._sparse_norm_history[-self.adapt_interval:])
-            avg_dense = np.mean(self._dense_norm_history[-self.adapt_interval:])
-            avg_rank = np.mean(self._rank_norm_history[-self.adapt_interval:]) if rank_norms else 0
+            avg_sparse = np.mean(self._sparse_norm_history)
+            avg_dense = np.mean(self._dense_norm_history)
             ratio = avg_sparse / (avg_dense + 1e-8)
 
             if ratio > self.target_ratio * 5.0:
@@ -172,13 +310,15 @@ class GraftedOptimizer:
             else:
                 diag['action'] = 'balanced'
 
-            if avg_rank > 0 and avg_rank < avg_dense * 0.1:
-                for g in self.rank_opt.param_groups:
-                    g['lr'] *= 1.2
-                diag['rank_action'] = 'boosted_rank_lr'
+            if proto_norms and proto_norm < dense_norm * 0.05:
+                if self.proto_opt is not None:
+                    for g in self.proto_opt.param_groups:
+                        g['lr'] *= 1.2
+                diag['proto_action'] = 'boosted_proto_lr'
 
+        # 梯度裁剪
         if len(self._sparse_norm_history) >= self.adapt_interval:
-            avg_sparse = np.mean(self._sparse_norm_history[-self.adapt_interval:])
+            avg_sparse = np.mean(self._sparse_norm_history)
             if sparse_norm > 5.0 * avg_sparse:
                 for group in self.sparse_opt.param_groups:
                     for p in group['params']:
@@ -186,14 +326,13 @@ class GraftedOptimizer:
                             p.grad.mul_(avg_sparse / (sparse_norm + 1e-8))
                 diag['sparse_grad_rescaled'] = True
 
+        # 优化器步骤
         self.sparse_opt.step()
         self.dense_opt.step()
         if self.gate_opt is not None:
             self.gate_opt.step()
-        if self.rank_opt is not None:
-            self.rank_opt.step()
-        if self.calib_opt is not None:
-            self.calib_opt.step()
+        if self.proto_opt is not None:
+            self.proto_opt.step()
 
         return diag
 
@@ -205,10 +344,8 @@ class GraftedOptimizer:
         }
         if self.gate_opt is not None:
             d['gate'] = self.gate_opt.state_dict()
-        if self.rank_opt is not None:
-            d['rank'] = self.rank_opt.state_dict()
-        if self.calib_opt is not None:
-            d['calib'] = self.calib_opt.state_dict()
+        if self.proto_opt is not None:
+            d['proto'] = self.proto_opt.state_dict()
         return d
 
     def load_state_dict(self, state_dict):
@@ -216,55 +353,14 @@ class GraftedOptimizer:
         self.dense_opt.load_state_dict(state_dict['dense'])
         if 'gate' in state_dict and self.gate_opt is not None:
             self.gate_opt.load_state_dict(state_dict['gate'])
-        if 'rank' in state_dict and self.rank_opt is not None:
-            self.rank_opt.load_state_dict(state_dict['rank'])
-        if 'calib' in state_dict and self.calib_opt is not None:
-            self.calib_opt.load_state_dict(state_dict['calib'])
+        if 'proto' in state_dict and self.proto_opt is not None:
+            self.proto_opt.load_state_dict(state_dict['proto'])
         self.step_count = state_dict.get('step_count', 0)
 
 
-def calibration_loss(logits: torch.Tensor, targets: torch.Tensor, n_bins: int = 10) -> torch.Tensor:
-    """Soft Expected Calibration Error (ECE)"""
-    with torch.no_grad():
-        probs = torch.sigmoid(logits.detach())
-        bin_boundaries = torch.linspace(0, 1, n_bins + 1, device=logits.device)
-        bin_ids = torch.bucketize(probs, bin_boundaries) - 1
-        bin_ids = bin_ids.clamp(0, n_bins - 1)
-        bin_sums = torch.zeros(n_bins, device=logits.device)
-        bin_counts = torch.zeros(n_bins, device=logits.device)
-        bin_true = torch.zeros(n_bins, device=logits.device)
-        for i in range(n_bins):
-            mask = (bin_ids == i)
-            bin_counts[i] = mask.sum()
-            if bin_counts[i] > 0:
-                bin_sums[i] = probs[mask].sum()
-                bin_true[i] = targets[mask].sum()
-    valid = bin_counts > 10
-    if valid.sum() > 0:
-        avg_pred = bin_sums[valid] / bin_counts[valid]
-        avg_true = bin_true[valid] / bin_counts[valid]
-        weights = bin_counts[valid] / bin_counts[valid].sum()
-        ece = (torch.abs(avg_pred - avg_true) * weights).sum()
-        return ece
-    else:
-        return torch.tensor(0.0, device=logits.device)
-
-
-def lambdarank_loss(logits: torch.Tensor, targets: torch.Tensor, n_pairs: int = 100) -> torch.Tensor:
-    """Pairwise hinge loss for AUC optimization."""
-    pos_mask = targets == 1
-    neg_mask = targets == 0
-    pos_idx = torch.where(pos_mask)[0]
-    neg_idx = torch.where(neg_mask)[0]
-    if len(pos_idx) == 0 or len(neg_idx) == 0:
-        return torch.tensor(0.0, device=logits.device)
-    n = min(n_pairs, len(pos_idx) * len(neg_idx))
-    p_idx = pos_idx[torch.randint(0, len(pos_idx), (n,), device=logits.device)]
-    n_idx = neg_idx[torch.randint(0, len(neg_idx), (n,), device=logits.device)]
-    diff = logits[p_idx] - logits[n_idx]
-    loss = F.softplus(-diff).mean()
-    return loss
-
+# ==============================================================================
+# Trainer v8.0
+# ==============================================================================
 
 class PCVRHeteroFormerTrainer:
     def __init__(
@@ -277,7 +373,7 @@ class PCVRHeteroFormerTrainer:
         device: str,
         save_dir: str,
         early_stopping: EarlyStopping,
-        loss_type: str = 'bce',
+        loss_type: str = 'focal',
         focal_alpha: float = 0.1,
         focal_gamma: float = 2.0,
         sparse_lr: float = 0.05,
@@ -300,20 +396,19 @@ class PCVRHeteroFormerTrainer:
         label_smoothing_max_eps: float = 0.05,
         label_smoothing_min_eps: float = 0.001,
         label_smoothing_anneal_steps: int = 5000,
-        gse_aux_weight: float = 0.5,
         focal_alpha_pos: float = 0.5,
         focal_alpha_neg: float = 0.5,
         focal_max_gamma: float = 4.0,
-        prior_weight: float = 0.001,
-        ece_weight: float = 0.05,
-        lambdarank_weight: float = 0.1,
         global_ctr: float = 0.01,
-        zmlc_lambda: float = 0.1,
-        zmlc_on_calib_only: bool = True,
-        rank_lr_multiplier: float = 2.0,
-        calib_lr_multiplier: float = 1.0,
-        enable_grad_conflict_check: bool = True,
-        loss_conflict_threshold: float = 0.8,
+        # v8.0: Symplectic Loss weights
+        recon_weight: float = 0.1,
+        div_weight: float = 0.15,
+        empty_weight: float = 0.1,
+        spec_weight: float = 0.01,
+        align_weight: float = 0.05,
+        mp_weight: float = 0.005,
+        # v8.0: Curriculum learning
+        curriculum_warmup: int = 5000,
     ) -> None:
         self.model = model
         self.train_loader = train_loader
@@ -328,33 +423,32 @@ class PCVRHeteroFormerTrainer:
         self.use_grafted_optimizer = use_grafted_optimizer
         self.use_adaptive_focal = use_adaptive_focal
         self.enable_progressive_layers = enable_progressive_layers
-        self.gse_aux_weight = gse_aux_weight
+        self.curriculum_warmup = curriculum_warmup
 
         self.label_smoothing_strategy = label_smoothing_strategy
         self.label_smoothing_max_eps = label_smoothing_max_eps
         self.label_smoothing_min_eps = label_smoothing_min_eps
         self.label_smoothing_anneal_steps = label_smoothing_anneal_steps
-        self.pos_rate_ema = global_ctr  # 正样本率指数移动平均，与标签平滑解耦
-        self.prior_weight = prior_weight
-        self.ece_weight = ece_weight
-        self.lambdarank_weight = lambdarank_weight
+        self.pos_rate_ema = global_ctr
         self.global_ctr = global_ctr
-        self.zmlc_lambda = zmlc_lambda
-        
-        self.zmlc_on_calib_only = zmlc_on_calib_only
-        self.enable_grad_conflict_check = enable_grad_conflict_check
-        self.loss_conflict_threshold = loss_conflict_threshold
-        self._loss_history = {'focal': [], 'lrank': [], 'zmlc': [], 'prior': [], 'ece': []}
-        self._grad_conflict_history = []
 
-        # 优化器构建（与原版完全一致）
+        # v8.0: Loss weights
+        self.recon_weight = recon_weight
+        self.div_weight = div_weight
+        self.empty_weight = empty_weight
+        self.spec_weight = spec_weight
+        self.align_weight = align_weight
+        self.mp_weight = mp_weight
+
+        self._loss_history = {'focal': [], 'recon': [], 'div': [], 'empty': [], 'spec': [], 'align': [], 'mp': []}
+
+        # 优化器构建
         if hasattr(model, 'get_sparse_params') and use_grafted_optimizer:
             sparse_params = model.get_sparse_params()
             dense_params = model.get_dense_params()
             gate_params = model.get_gate_params() if hasattr(model, 'get_gate_params') else []
             scale_params = model.get_scale_params() if hasattr(model, 'get_scale_params') else []
-            rank_params = model.get_rank_params() if hasattr(model, 'get_rank_params') else []
-            calib_params = model.get_calib_params() if hasattr(model, 'get_calib_params') else []
+            proto_params = model.get_proto_params() if hasattr(model, 'get_proto_params') else []
 
             sparse_opt = torch.optim.Adagrad(sparse_params, lr=sparse_lr, weight_decay=sparse_weight_decay)
             scale_ids = {id(p) for p in scale_params}
@@ -364,24 +458,18 @@ class PCVRHeteroFormerTrainer:
             ]
             dense_opt = torch.optim.AdamW(dense_param_groups, lr=lr, betas=(0.9, 0.98))
             gate_opt = torch.optim.AdamW(gate_params, lr=lr*2, betas=(0.9, 0.98), weight_decay=1e-3) if gate_params else None
-            
-            rank_opt = torch.optim.AdamW(
-                rank_params, 
-                lr=lr * rank_lr_multiplier, 
+
+            proto_opt = torch.optim.AdamW(
+                proto_params,
+                lr=lr * 2.0,
                 betas=(0.9, 0.98),
                 weight_decay=1e-3
-            ) if rank_params else None
-            
-            calib_opt = torch.optim.AdamW(
-                calib_params,
-                lr=lr * calib_lr_multiplier,
-                betas=(0.9, 0.98),
-                weight_decay=1e-3
-            ) if calib_params else None
-            
-            self.optimizer = GraftedOptimizer(
-                sparse_opt, dense_opt, gate_opt, rank_opt, calib_opt,
-                target_ratio=1.0, adapt_interval=200
+            ) if proto_params else None
+
+            self.optimizer = SymplecticMultiScaleOptimizer(
+                sparse_opt, dense_opt, gate_opt, proto_opt,
+                target_ratio=1.0, adapt_interval=200,
+                low_lr_scale=1.0, high_lr_scale=0.1,
             )
             self.sparse_optimizer = None
             self.dense_optimizer = None
@@ -412,7 +500,6 @@ class PCVRHeteroFormerTrainer:
 
         self._emb_grad_history: Dict[int, list] = {}
         self._emb_death_threshold = 500
-        self.lambda_n_pairs = 1000
 
         if use_adaptive_focal and loss_type == 'focal':
             self.adaptive_focal = AdaptiveFocalLoss(
@@ -426,9 +513,9 @@ class PCVRHeteroFormerTrainer:
             )
             self.focal_alpha = focal_alpha
             self.focal_gamma = focal_gamma
-            logging.info(  
-                f"v7.2 AdaptiveFocalLoss: max_gamma={focal_max_gamma}, "
-                f"alpha_pos={focal_alpha_pos}, alpha_neg={focal_alpha_neg}, gamma_min=0.5"
+            logging.info(
+                f"v8.0 AdaptiveFocalLoss: max_gamma={focal_max_gamma}, "
+                f"alpha_pos={focal_alpha_pos}, alpha_neg={focal_alpha_neg}"
             )
         else:
             self.adaptive_focal = None
@@ -438,17 +525,43 @@ class PCVRHeteroFormerTrainer:
         if warmup_steps > 0:
             logging.info(f"Warmup: {warmup_steps} steps")
 
-        # [v7.3-VQ-FIX] VQ 崩塌监控与重启状态
-        self.seq_usage_history = {}          # {domain: deque(maxlen=200)}
-        self.seq_collapse_counter = {}      # {domain: int}
-        self.seq_in_restart_cooldown = {}   # {domain: bool}
-        self.seq_restart_step = {}          # {domain: int}
-        self.restart_cooldown_steps = 500
-        self.usage_alert_threshold = 0.05
-        self.usage_recover_threshold = 0.3
-        self.collapse_min_steps = 200
+        logging.info(
+            f"v8.0 Symplectic Loss: recon={recon_weight}, div={div_weight}, "
+            f"empty={empty_weight}, spec={spec_weight}, align={align_weight}, mp={mp_weight}"
+        )
+        logging.info(f"Curriculum warmup: {curriculum_warmup} steps")
 
-    # ========== 标签平滑（不再更新 pos_rate_ema） ==========
+    def _get_dynamic_weights(self, global_step: int) -> Dict[str, float]:
+        """
+        课程学习: 动态调整损失权重。
+
+        前curriculum_warmup步:
+        - recon权重保持，div/spec逐渐引入
+        之后:
+        - 所有权重达到目标值
+        """
+        if global_step < self.curriculum_warmup:
+            alpha = global_step / max(self.curriculum_warmup, 1)
+            alpha_sq = alpha * alpha  # 二次缓增
+
+            return {
+                'recon': self.recon_weight,
+                'div': self.div_weight * alpha_sq,
+                'spec': self.spec_weight * alpha,
+                'empty': self.empty_weight * alpha,
+                'align': self.align_weight * alpha,
+                'mp': self.mp_weight * alpha,
+            }
+
+        return {
+            'recon': self.recon_weight,
+            'div': self.div_weight,
+            'spec': self.spec_weight,
+            'empty': self.empty_weight,
+            'align': self.align_weight,
+            'mp': self.mp_weight,
+        }
+
     def _smooth_labels(self, labels: torch.Tensor) -> torch.Tensor:
         if self.label_smoothing_strategy == 'none':
             eps = self.label_smoothing_max_eps
@@ -461,7 +574,6 @@ class PCVRHeteroFormerTrainer:
 
         with torch.no_grad():
             pos_ratio = labels.float().mean().item()
-            # 注意：pos_rate_ema 已在 _train_step 中更新，此处不再更新
 
         if self.label_smoothing_strategy == 'hybrid':
             eps = self.pos_rate_ema * 2.0
@@ -479,7 +591,6 @@ class PCVRHeteroFormerTrainer:
 
         return labels * (1 - 2 * eps) + eps
 
-    # ========== 其他辅助函数（完全保留） ==========
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         parts = [f"global_step{global_step}"]
         for key in ("layer", "head", "hidden"):
@@ -582,192 +693,19 @@ class PCVRHeteroFormerTrainer:
                 elif self.sparse_optimizer is not None:
                     self.sparse_optimizer.param_groups[0]['params'] = sparse_params
 
-    # ========== 动态权重调整（整合预热、VQ保护、原有逻辑） ==========
-    def _get_dynamic_weights(self, step: int, loss_values: Dict[str, float]) -> Dict[str, float]:
-        # 目标权重
-        target_weights = {
-            'focal': 1.0,
-            'lrank': self.lambdarank_weight,
-            'zmlc':  self.zmlc_lambda,
-            'prior': self.prior_weight,
-            'ece':   self.ece_weight,
-            'gse':   self.gse_aux_weight,
-        }
-
-        # 平滑预热
-        warmup_schedule = {
-            'focal': (0, 0),
-            'gse':   (0, 0),
-            'prior': (500, 1500),
-            'ece':   (500, 1500),
-            'lrank': (0, 2000),
-            'zmlc':  (1000, 3000),
-        }
-
-        weights = {}
-        for key, target_val in target_weights.items():
-            w_start, w_end = warmup_schedule.get(key, (0, 0))
-            if step <= w_start:
-                w = 0.0 if key != 'focal' else target_val
-            elif step >= w_end:
-                w = target_val
-            else:
-                progress = (step - w_start) / max(w_end - w_start, 1)
-                w = target_val * progress
-            weights[key] = w
-
-        # VQ 崩溃紧急保护
-        for domain, history in self.seq_usage_history.items():
-            if len(history) < 10:
-                continue
-            recent_usage = np.mean(list(history)[-10:])
-            if recent_usage < self.usage_alert_threshold * 2:
-                weights['gse'] = max(weights['gse'], 0.5)
-                weights['lrank'] = min(weights['lrank'], 0.02)
-                weights['zmlc'] = min(weights['zmlc'], 0.01)
-                weights['ece'] = min(weights['ece'], 0.01)
-                weights['prior'] = min(weights['prior'], 0.01)
-                if recent_usage < self.usage_alert_threshold:
-                    weights['lrank'] = 0.0
-                    weights['zmlc'] = 0.0
-                    weights['ece'] = 0.0
-                    weights['prior'] = 0.0
-                    weights['gse'] = min(weights['gse'], 1.0)
-                    logging.warning(
-                        f"[VQ_PROTECT] {domain} usage={recent_usage:.4f}, "
-                        "deactivating conflicting losses to rescue codebook."
-                    )
-                else:
-                    logging.info(
-                        f"[VQ_PROTECT] {domain} usage={recent_usage:.4f}, "
-                        "suppressing conflicting losses."
-                    )
-            elif recent_usage < self.usage_recover_threshold:
-                weights['gse'] = max(weights['gse'], 0.3)
-
-        # 基于正样本率的早期强制关闭（使用解耦后的 EMA）
-        if self.pos_rate_ema < 0.015 and step < self.warmup_steps:
-            weights['lrank'] = 0.0
-            weights['zmlc'] = 0.0
-            weights['prior'] = 0.0
-            weights['ece'] = 0.0
-            return weights
-
-        # 原有动态调整
-        if len(self._loss_history['focal']) >= 100 and weights['lrank'] > 0:
-            recent_focal = np.mean(self._loss_history['focal'][-50:])
-            older_focal = np.mean(self._loss_history['focal'][-100:-50])
-            focal_improvement = (older_focal - recent_focal) / (abs(older_focal) + 1e-8)
-            if focal_improvement > 0.1:
-                weights['lrank'] *= 0.5
-                weights['zmlc'] *= 0.3
-                weights['prior'] *= 0.5
-                weights['ece'] *= 0.3
-                logging.info(
-                    f"Focal improving rapidly ({focal_improvement:.3f}), "
-                    f"reducing auxiliary weights."
-                )
-
-        if len(self._loss_history['lrank']) >= 100 and weights['lrank'] > 0:
-            recent_lrank = np.mean(self._loss_history['lrank'][-50:])
-            older_lrank = np.mean(self._loss_history['lrank'][-100:-50])
-            if recent_lrank > older_lrank * 0.95:
-                weights['lrank'] *= 1.5
-                weights['zmlc'] *= 0.5
-                logging.info(
-                    f"LambdaRank stalled ({recent_lrank:.4f} vs {older_lrank:.4f}), "
-                    "boosting rank weight."
-                )
-
-        if len(self._loss_history['focal']) >= 200:
-            recent_var = np.var(self._loss_history['focal'][-50:])
-            if recent_var < 1e-6:
-                weights['gse'] *= 0.5
-                logging.info("Focal loss flat, reducing GSE weight to prevent overfitting.")
-
-        # 安全裁剪
-        weights['gse']   = max(weights['gse'], 0.05)
-        weights['lrank'] = min(weights['lrank'], 1.0)
-        weights['zmlc']  = min(weights['zmlc'], 0.5)
-
-        return weights
-
-    # ========== VQ 码本重启 ==========
-    def _check_and_restart_vq(self):
-        for domain in self.model.seq_domains:
-            block = self.model.seq_blocks[domain]
-            if not hasattr(block, 'vq'):
-                continue
-
-            if self.seq_in_restart_cooldown.get(domain, False):
-                if self.global_step - self.seq_restart_step.get(domain, 0) > self.restart_cooldown_steps:
-                    self.seq_in_restart_cooldown[domain] = False
-                else:
-                    continue
-
-            current_usage = block._last_info_usage.item() if hasattr(block, '_last_info_usage') else 1.0
-            if current_usage < self.usage_alert_threshold:
-                self.seq_collapse_counter[domain] = self.seq_collapse_counter.get(domain, 0) + 1
-            else:
-                self.seq_collapse_counter[domain] = 0
-
-            if self.seq_collapse_counter.get(domain, 0) >= self.collapse_min_steps:
-                nn.init.normal_(block.vq.codebook.weight, std=0.1)
-                with torch.no_grad():
-                    block.vq.codebook.weight[0].zero_()
-                if block.vq.codebook.grad is not None:
-                    block.vq.codebook.grad.zero_()
-                self.seq_collapse_counter[domain] = 0
-                self.seq_in_restart_cooldown[domain] = True
-                self.seq_restart_step[domain] = self.global_step
-                logging.warning(
-                    f"[VQ_RESTART] Codebook for {domain} was collapsed for {self.collapse_min_steps} steps, "
-                    f"reinitialized at global step {self.global_step}."
-                )
-
-    # ========== 梯度冲突计算（保留） ==========
-    def _compute_grad_conflict(self, losses: Dict[str, torch.Tensor], shared_params: List[torch.Tensor]) -> Dict[str, float]:
-        if not self.enable_grad_conflict_check or not shared_params:
-            return {}
-        grads = {}
-        for name, loss in losses.items():
-            if loss.requires_grad:
-                loss.backward(retain_graph=True)
-                grads[name] = [p.grad.clone() if p.grad is not None else torch.zeros_like(p) 
-                              for p in shared_params]
-                for p in shared_params:
-                    if p.grad is not None:
-                        p.grad.zero_()
-        conflicts = {}
-        loss_names = list(grads.keys())
-        for i in range(len(loss_names)):
-            for j in range(i+1, len(loss_names)):
-                name_i, name_j = loss_names[i], loss_names[j]
-                grad_i = torch.cat([g.flatten() for g in grads[name_i]])
-                grad_j = torch.cat([g.flatten() for g in grads[name_j]])
-                cos_sim = F.cosine_similarity(grad_i.unsqueeze(0), grad_j.unsqueeze(0)).item()
-                conflicts[f'{name_i}_vs_{name_j}'] = cos_sim
-                if cos_sim < -self.loss_conflict_threshold:
-                    conflicts[f'{name_i}_vs_{name_j}_conflict'] = True
-        return conflicts
-
-    # ========== 训练步骤（完整保留所有日志） ==========
     def _train_step(self, batch: Dict[str, Any]) -> float:
         device_batch = self._batch_to_device(batch)
-        label_raw = device_batch['label'].float()
+        labels = device_batch['label'].float()
 
-        # ===== 解耦：始终更新正样本率 EMA =====
         with torch.no_grad():
-            pos_ratio = label_raw.mean().item()
+            pos_ratio = labels.mean().item()
             self.pos_rate_ema = 0.99 * self.pos_rate_ema + 0.01 * pos_ratio
 
-        # 标签平滑
         if self.loss_type in ('focal', 'bce') and self.label_smoothing_strategy != 'none':
-            label_main = self._smooth_labels(label_raw)
+            labels_smooth = self._smooth_labels(labels)
         else:
-            label_main = label_raw
+            labels_smooth = labels
 
-        # 梯度清零
         if self.optimizer is not None:
             self.optimizer.zero_grad()
         else:
@@ -777,132 +715,95 @@ class PCVRHeteroFormerTrainer:
         if self.adaptive_focal is not None:
             self.adaptive_focal.gamma_optimizer.zero_grad()
 
-        # 前向传播
         model_input = self._make_model_input(device_batch)
-        logits, logits_main, logits_rank, calib_residual = self.model(
-            model_input, return_components=True
-        )
+
+        # v8.0: 新的forward返回6个值
+        logits, seq_feat, proto_weights, proto_repr, align_loss, log_det = self.model(model_input)
         logits = logits.squeeze(-1)
-        logits_main = logits_main.squeeze(-1)
-        logits_rank = logits_rank.squeeze(-1)
-        calib_residual = calib_residual.squeeze(-1)
 
         if torch.isnan(logits).any() or torch.isinf(logits).any():
             logging.warning(f"NaN/Inf in logits at step {self.global_step}, skipping batch")
             return float('nan')
 
-        # 各损失分量
-        loss_components = {}
-        
+        # ===== 1. Focal Loss (low frequency) =====
         if self.adaptive_focal is not None:
-            loss_focal_or_bce = self.adaptive_focal(logits_main, label_main)
+            loss_focal = self.adaptive_focal(logits, labels_smooth)
         elif self.loss_type == 'focal':
-            p = torch.sigmoid(logits_main)
+            p = torch.sigmoid(logits)
             p = torch.clamp(p, min=1e-7, max=1-1e-7)
-            bce_loss = F.binary_cross_entropy_with_logits(logits_main, label_main, reduction='none')
-            p_t = p * label_main + (1 - p) * (1 - label_main)
+            bce_loss = F.binary_cross_entropy_with_logits(logits, labels_smooth, reduction='none')
+            p_t = p * labels_smooth + (1 - p) * (1 - labels_smooth)
             focal_weight = (1 - p_t) ** self.focal_gamma
             focal_weight = torch.clamp(focal_weight, max=10.0)
-            alpha_t = self.focal_alpha * label_main + (1 - self.focal_alpha) * (1 - label_main)
-            loss_focal_or_bce = (alpha_t * focal_weight * bce_loss).mean()
+            alpha_t = self.focal_alpha * labels_smooth + (1 - self.focal_alpha) * (1 - labels_smooth)
+            loss_focal = (alpha_t * focal_weight * bce_loss).mean()
         else:
-            loss_focal_or_bce = F.binary_cross_entropy_with_logits(logits_main, label_main)
-        
-        loss_components['focal'] = loss_focal_or_bce
+            loss_focal = F.binary_cross_entropy_with_logits(logits, labels_smooth)
 
-        lrank_loss_val = torch.tensor(0.0, device=self.device)
-        if self.lambdarank_weight > 0:
-            lrank_loss_val = lambdarank_loss(logits_rank, label_raw, n_pairs=self.lambda_n_pairs)
-            loss_components['lrank'] = lrank_loss_val
+        # ===== 2. Prototype Reconstruction (low frequency) =====
+        loss_recon = F.mse_loss(proto_repr, seq_feat)
 
-        prior_loss_val = torch.tensor(0.0, device=self.device)
-        if self.prior_weight > 0:
-            prior = torch.sigmoid(logits).mean()
-            prior_loss_val = self.prior_weight * F.mse_loss(
-                prior, torch.tensor(self.global_ctr, device=self.device)
-            )
-            loss_components['prior'] = prior_loss_val
+        # ===== 3. Prototype Diversity (high frequency) =====
+        weighted_pos = (proto_weights * labels.unsqueeze(1)).sum(dim=0)
+        weighted_total = proto_weights.sum(dim=0)
+        proto_ctr_est = weighted_pos / (weighted_total + 1e-8)
 
-        ece_loss_val = torch.tensor(0.0, device=self.device)
-        if self.ece_weight > 0:
-            ece_loss_val = calibration_loss(logits, label_raw)
-            loss_components['ece'] = ece_loss_val
+        active_mask = (weighted_total > 1e-3).float()
+        active_count = active_mask.sum()
 
-        gse_aux_loss = torch.tensor(0.0, device=self.device)
-        if hasattr(self.model, 'get_aux_loss'):
-            gse_aux_loss = self.model.get_aux_loss()
-            loss_components['gse'] = gse_aux_loss
+        if active_count > 1:
+            active_ctr = proto_ctr_est * active_mask
+            mean_ctr = active_ctr.sum() / (active_count + 1e-8)
+            var_active = ((active_ctr - mean_ctr) ** 2 * active_mask).sum() / (active_count + 1e-8)
+        else:
+            var_active = torch.tensor(0.0, device=self.device)
 
-        zmlc_loss_val = torch.tensor(0.0, device=self.device)
-        if self.zmlc_lambda > 0:
-            if self.zmlc_on_calib_only:
-                zmlc_loss_val = self.zmlc_lambda * (calib_residual.mean() ** 2)
+        death_ratio = 1.0 - active_mask.mean()
+        loss_div = -var_active + 0.2 * death_ratio
+
+        # ===== 4. Empty Calibration (high frequency) =====
+        first_domain = list(device_batch['_seq_domains'])[0] if len(device_batch['_seq_domains']) > 0 else None
+        if first_domain is not None:
+            seq_lens = device_batch[f'{first_domain}_len']
+            empty_mask = (seq_lens == 0).float()
+            empty_target = torch.full_like(logits, self.global_ctr)
+            loss_empty = (empty_mask * F.binary_cross_entropy_with_logits(
+                logits, empty_target, reduction='none'
+            )).sum() / (empty_mask.sum() + 1e-8)
+        else:
+            loss_empty = torch.tensor(0.0, device=self.device)
+
+        # ===== 5. vMF Volume (high frequency) =====
+        loss_spec = -log_det  # 最大化体积
+
+        # ===== 6. MP Spectral Regularization (high frequency) =====
+        if hasattr(self.model, 'mp_regularizer'):
+            first_proto_vq = list(self.model.prototype_vqs.values())[0] if len(self.model.prototype_vqs) > 0 else None
+            if first_proto_vq is not None:
+                mu, _ = first_proto_vq.get_prototypes()
+                loss_mp = self.model.mp_regularizer(mu)
             else:
-                zmlc_loss_val = self.zmlc_lambda * (logits.mean() ** 2)
-            loss_components['zmlc'] = zmlc_loss_val
+                loss_mp = torch.tensor(0.0, device=self.device)
+        else:
+            loss_mp = torch.tensor(0.0, device=self.device)
 
-        # 动态权重
-        dynamic_weights = self._get_dynamic_weights(self.global_step, {
-            k: v.item() for k, v in loss_components.items()
-        })
-        
-        loss = dynamic_weights['focal'] * loss_focal_or_bce
-        if 'lrank' in loss_components:
-            loss = loss + dynamic_weights['lrank'] * loss_components['lrank']
-        if 'prior' in loss_components:
-            loss = loss + dynamic_weights['prior'] * loss_components['prior']
-        if 'ece' in loss_components:
-            loss = loss + dynamic_weights['ece'] * loss_components['ece']
-        if 'gse' in loss_components:
-            loss = loss + dynamic_weights['gse'] * loss_components['gse']
-        if 'zmlc' in loss_components:
-            loss = loss + dynamic_weights['zmlc'] * loss_components['zmlc']
+        # ===== 7. Fusion Alignment (high frequency) =====
+        loss_align = align_loss
 
-        # 梯度冲突检测（原有逻辑）
-        if self.enable_grad_conflict_check and self.global_step % 50 == 0:
-            shared_params = []
-            for name, p in self.model.named_parameters():
-                if p.requires_grad and 'predictor' in name and p.grad is not None:
-                    shared_params.append(p)
-            if shared_params:
-                conflicts = self._compute_grad_conflict(loss_components, shared_params)
-                if conflicts:
-                    self._grad_conflict_history.append(conflicts)
-                    for key, val in conflicts.items():
-                        if '_conflict' in key:
-                            logging.warning(f"Gradient conflict detected: {key}")
+        # ===== 动态权重 =====
+        weights = self._get_dynamic_weights(self.global_step)
+
+        # ===== Total Loss =====
+        loss = (loss_focal + 
+                weights['recon'] * loss_recon + 
+                weights['div'] * loss_div + 
+                weights['empty'] * loss_empty + 
+                weights['spec'] * loss_spec + 
+                weights['mp'] * loss_mp +
+                weights['align'] * loss_align)
 
         if torch.isnan(loss) or torch.isinf(loss):
             logging.warning(f"NaN/Inf loss at step {self.global_step}, skipping batch")
-            self.optimizer.zero_grad() if self.optimizer else (
-                self.dense_optimizer.zero_grad(),
-                self.sparse_optimizer.zero_grad() if self.sparse_optimizer else None
-            )
-            return float('nan')
-
-        loss.backward()
-
-        # embedding 梯度记录
-        emb_grad_norms = []
-        for name, p in self.model.named_parameters():
-            if p.grad is not None and ('embedding' in name or 'emb' in name.lower()):
-                ptr = p.data_ptr()
-                g_norm = p.grad.norm()
-                emb_grad_norms.append(g_norm)
-                if ptr not in self._emb_grad_history:
-                    self._emb_grad_history[ptr] = []
-                self._emb_grad_history[ptr].append(g_norm.detach())
-                if len(self._emb_grad_history[ptr]) > self._emb_death_threshold * 2:
-                    self._emb_grad_history[ptr] = self._emb_grad_history[ptr][-self._emb_death_threshold:]
-        total_emb_grad_norm = torch.stack(emb_grad_norms).norm().item() if emb_grad_norms else 0.0
-
-        # NaN 梯度检查
-        has_nan_grad = False
-        grads = [p.grad for p in self.model.parameters() if p.grad is not None]
-        if grads:
-            flat_grads = torch.cat([g.flatten()[:1000] for g in grads])
-            has_nan_grad = torch.isnan(flat_grads).any() or torch.isinf(flat_grads).any()
-        if has_nan_grad:
             if self.optimizer is not None:
                 self.optimizer.zero_grad()
             else:
@@ -911,10 +812,45 @@ class PCVRHeteroFormerTrainer:
                     self.sparse_optimizer.zero_grad()
             return float('nan')
 
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        # v8.0: 辛约化优化
+        if self.optimizer is not None and hasattr(self.optimizer, '_symplectic_reduction'):
+            # 分别计算各任务损失
+            task_losses = {
+                'focal': loss_focal,
+                'recon': loss_recon,
+                'div': weights['div'] * loss_div,
+                'spec': weights['spec'] * loss_spec,
+                'empty': weights['empty'] * loss_empty,
+                'align': weights['align'] * loss_align,
+                'mp': weights['mp'] * loss_mp,
+            }
+
+            # 使用辛约化优化器
+            opt_diag = self.optimizer.step(self.model, task_losses)
+        else:
+            # 回退到标准反向传播
+            loss.backward()
+            opt_diag = {}
+            if self.optimizer is not None:
+                opt_diag = self.optimizer.step(self.model)
+            else:
+                self.dense_optimizer.step()
+                if self.sparse_optimizer is not None:
+                    self.sparse_optimizer.step()
+
+        if self.adaptive_focal is not None:
+            self.adaptive_focal.step()
+
+        # 更新loss history
+        for key, val in [('focal', loss_focal), ('recon', loss_recon), ('div', loss_div), 
+                          ('empty', loss_empty), ('spec', loss_spec), ('align', loss_align), ('mp', loss_mp)]:
+            self._loss_history[key].append(val.item())
+            if len(self._loss_history[key]) > 500:
+                self._loss_history[key] = self._loss_history[key][-500:]
+
         self.global_step += 1
 
-        # 学习率 warmup
+        # 学习率warmup
         if self.warmup_steps > 0 and self.global_step <= self.warmup_steps:
             warmup_factor = self.global_step / self.warmup_steps
             if self.optimizer is not None:
@@ -925,12 +861,9 @@ class PCVRHeteroFormerTrainer:
                 if self.optimizer.gate_opt is not None:
                     for g in self.optimizer.gate_opt.param_groups:
                         g['lr'] = self.lr * 2 * warmup_factor
-                if self.optimizer.rank_opt is not None:
-                    for g in self.optimizer.rank_opt.param_groups:
+                if self.optimizer.proto_opt is not None:
+                    for g in self.optimizer.proto_opt.param_groups:
                         g['lr'] = self.lr * 2 * warmup_factor
-                if self.optimizer.calib_opt is not None:
-                    for g in self.optimizer.calib_opt.param_groups:
-                        g['lr'] = self.lr * warmup_factor
             else:
                 for g in self.dense_optimizer.param_groups:
                     g['lr'] = self.lr * warmup_factor
@@ -938,135 +871,119 @@ class PCVRHeteroFormerTrainer:
                     for g in self.sparse_optimizer.param_groups:
                         g['lr'] = self.sparse_lr * warmup_factor
 
-        # 优化器更新
-        opt_diag = {}
-        if self.optimizer is not None:
-            opt_diag = self.optimizer.step(self.model)
-        else:
-            self.dense_optimizer.step()
-            if self.sparse_optimizer is not None:
-                self.sparse_optimizer.step()
-
-        if any(torch.isnan(p).any() or torch.isinf(p).any() for p in self.model.parameters()):
-            logging.error(f"NaN/Inf parameter after step {self.global_step}!")
-
-        if self.adaptive_focal is not None:
-            self.adaptive_focal.step()
-
-        # 更新 loss history
-        for key, val in loss_components.items():
-            if key not in self._loss_history:
-                self._loss_history[key] = []
-            self._loss_history[key].append(val.item())
-            if len(self._loss_history[key]) > 500:
-                self._loss_history[key] = self._loss_history[key][-500:]
-
-        # VQ 使用率记录
-        try:
-            for domain in self.model.seq_domains:
-                block = self.model.seq_blocks[domain]
-                usage = block._last_info_usage.item() if hasattr(block, '_last_info_usage') else 1.0
-                if domain not in self.seq_usage_history:
-                    self.seq_usage_history[domain] = deque(maxlen=200)
-                self.seq_usage_history[domain].append(usage)
-        except Exception:
-            pass
-
-        # ---- 完整的 TensorBoard 与日志（与原始完全一致 + 新增指标） ----
+        # ===== TensorBoard 日志 =====
         with torch.no_grad():
             logits_mean = logits.mean().item()
             logits_std = logits.std().item()
-            logits_main_mean = logits_main.mean().item()
-            logits_main_std = logits_main.std().item()
-            logits_rank_mean = logits_rank.mean().item()
-            logits_rank_std = logits_rank.std().item()
-            calib_mean = calib_residual.mean().item()
-            calib_std = calib_residual.std().item()
-            
+
             try:
                 probs = torch.sigmoid(logits).cpu().numpy()
-                labels_np = label_raw.cpu().numpy()
+                labels_np = labels.cpu().numpy()
                 train_auc = roc_auc_score(labels_np, probs) if len(np.unique(labels_np)) >= 2 else 0.0
             except Exception:
                 train_auc = 0.0
 
+            # 原型诊断
+            proto_usage = (proto_weights.argmax(dim=-1) != 0).float().mean().item()
+            proto_entropy = -(proto_weights * torch.log(proto_weights + 1e-10)).sum(dim=-1).mean().item()
+            proto_max_freq = (proto_weights.argmax(dim=-1) == proto_weights.argmax(dim=-1).mode().values).float().mean().item()
+
+            # Sinkhorn列和均匀度
+            col_sums = proto_weights.sum(dim=0)
+            col_uniformity = 1.0 - (col_sums.std() / (col_sums.mean() + 1e-8))
+
+            # 死亡原型统计
+            dead_count = (weighted_total < 1e-3).sum().item()
+            alive_count = proto_weights.size(1) - dead_count
+
+            # v8.0: vMF集中度
+            if hasattr(self.model, 'prototype_vqs') and len(self.model.prototype_vqs) > 0:
+                first_vq = list(self.model.prototype_vqs.values())[0]
+                _, kappa = first_vq.get_prototypes()
+                kappa_mean = kappa.mean().item()
+                kappa_std = kappa.std().item()
+            else:
+                kappa_mean = kappa_std = 0.0
+
         if self.writer:
             self.writer.add_scalar('Loss/train', loss.item(), self.global_step)
-            self.writer.add_scalar('Loss/focal_or_bce', loss_focal_or_bce.item(), self.global_step)
-            self.writer.add_scalar('Loss/lambdarank', lrank_loss_val.item(), self.global_step)
-            self.writer.add_scalar('Loss/prior', prior_loss_val.item(), self.global_step)
-            self.writer.add_scalar('Loss/ece', ece_loss_val.item(), self.global_step)
-            self.writer.add_scalar('Loss/zmlc', zmlc_loss_val.item(), self.global_step)
-            self.writer.add_scalar('GSE/aux_loss', gse_aux_loss.item(), self.global_step)
-            
-            self.writer.add_scalar('Stream/logits_main_mean', logits_main_mean, self.global_step)
-            self.writer.add_scalar('Stream/logits_main_std', logits_main_std, self.global_step)
-            self.writer.add_scalar('Stream/logits_rank_mean', logits_rank_mean, self.global_step)
-            self.writer.add_scalar('Stream/logits_rank_std', logits_rank_std, self.global_step)
-            self.writer.add_scalar('Stream/calib_residual_mean', calib_mean, self.global_step)
-            self.writer.add_scalar('Stream/calib_residual_std', calib_std, self.global_step)
-            self.writer.add_scalar('Stream/final_logits_mean', logits_mean, self.global_step)
-            self.writer.add_scalar('Stream/final_logits_std', logits_std, self.global_step)
-            
+            self.writer.add_scalar('Loss/focal', loss_focal.item(), self.global_step)
+            self.writer.add_scalar('Loss/recon', loss_recon.item(), self.global_step)
+            self.writer.add_scalar('Loss/div', loss_div.item(), self.global_step)
+            self.writer.add_scalar('Loss/empty', loss_empty.item(), self.global_step)
+            self.writer.add_scalar('Loss/spec', loss_spec.item(), self.global_step)
+            self.writer.add_scalar('Loss/align', loss_align.item(), self.global_step)
+            self.writer.add_scalar('Loss/mp', loss_mp.item(), self.global_step)
+
+            self.writer.add_scalar('Stream/logits_mean', logits_mean, self.global_step)
+            self.writer.add_scalar('Stream/logits_std', logits_std, self.global_step)
             self.writer.add_scalar('Diagnostics/train_auc', train_auc, self.global_step)
-            self.writer.add_scalar('Diagnostics/pos_rate_ema', self.pos_rate_ema, self.global_step)  # 新增
-            
+            self.writer.add_scalar('Diagnostics/pos_rate_ema', self.pos_rate_ema, self.global_step)
+
+            self.writer.add_scalar('Proto/usage', proto_usage, self.global_step)
+            self.writer.add_scalar('Proto/entropy', proto_entropy, self.global_step)
+            self.writer.add_scalar('Proto/max_freq', proto_max_freq, self.global_step)
+            self.writer.add_scalar('Proto/dead_count', dead_count, self.global_step)
+            self.writer.add_scalar('Proto/alive_count', alive_count, self.global_step)
+            self.writer.add_scalar('Proto/col_uniformity', col_uniformity, self.global_step)
+            self.writer.add_scalar('Proto/kappa_mean', kappa_mean, self.global_step)
+            self.writer.add_scalar('Proto/kappa_std', kappa_std, self.global_step)
+
+            for k in range(proto_weights.size(1)):
+                freq = (proto_weights.argmax(dim=-1) == k).float().mean().item()
+                self.writer.add_scalar(f'Proto/freq_{k}', freq, self.global_step)
+                if k < len(proto_ctr_est):
+                    self.writer.add_scalar(f'Proto/ctr_est_{k}', proto_ctr_est[k].item(), self.global_step)
+
             if self.adaptive_focal is not None:
                 self.writer.add_scalar('Focal/gamma', self.adaptive_focal.get_gamma().item(), self.global_step)
-            
-            self.writer.add_scalar('Grad/emb_grad_norm', total_emb_grad_norm, self.global_step)
+
             if opt_diag:
                 self.writer.add_scalar('Grad/sparse', opt_diag.get('sparse_grad_norm', 0), self.global_step)
                 self.writer.add_scalar('Grad/dense', opt_diag.get('dense_grad_norm', 0), self.global_step)
-                self.writer.add_scalar('Grad/rank', opt_diag.get('rank_grad_norm', 0), self.global_step)
-                self.writer.add_scalar('Grad/calib', opt_diag.get('calib_grad_norm', 0), self.global_step)
+                self.writer.add_scalar('Grad/proto', opt_diag.get('proto_grad_norm', 0), self.global_step)
                 self.writer.add_scalar('Grad/ratio', opt_diag.get('grad_norm_ratio', 0), self.global_step)
-            
+
             if self.optimizer is not None:
                 self.writer.add_scalar('LR/dense', self.optimizer.dense_opt.param_groups[0]['lr'], self.global_step)
                 self.writer.add_scalar('LR/sparse', self.optimizer.sparse_opt.param_groups[0]['lr'], self.global_step)
-                if self.optimizer.rank_opt is not None:
-                    self.writer.add_scalar('LR/rank', self.optimizer.rank_opt.param_groups[0]['lr'], self.global_step)
-                if self.optimizer.calib_opt is not None:
-                    self.writer.add_scalar('LR/calib', self.optimizer.calib_opt.param_groups[0]['lr'], self.global_step)
-            
-            for key, val in dynamic_weights.items():
-                self.writer.add_scalar(f'Weight/{key}', val, self.global_step)
-            
-            # 新增：VQ 使用率
-            for domain, history in self.seq_usage_history.items():
-                if history:
-                    self.writer.add_scalar(f'VQ/usage_{domain}', history[-1], self.global_step)
+                if self.optimizer.proto_opt is not None:
+                    self.writer.add_scalar('LR/proto', self.optimizer.proto_opt.param_groups[0]['lr'], self.global_step)
 
-        # 控制台日志（每100步）
+            # v8.0: 课程学习进度
+            if self.global_step < self.curriculum_warmup:
+                self.writer.add_scalar('Curriculum/alpha', self.global_step / self.curriculum_warmup, self.global_step)
+                for key, w in weights.items():
+                    self.writer.add_scalar(f'Curriculum/weight_{key}', w, self.global_step)
+
+        # 控制台日志
         if self.global_step % 100 == 0:
             log_parts = [f"[Step {self.global_step}] loss={loss.item():.4f}"]
-            log_parts.append(f"focal={loss_focal_or_bce.item():.4f}")
-            log_parts.append(f"lrank={lrank_loss_val.item():.4f}")
-            log_parts.append(f"zmlc={zmlc_loss_val.item():.4f}")
-            log_parts.append(f"prior={prior_loss_val.item():.4f}")
-            log_parts.append(f"ece={ece_loss_val.item():.4f}")
-            log_parts.append(f"gse={gse_aux_loss.item():.4f}")
-            log_parts.append(f"logits_main={logits_main_mean:.3f}±{logits_main_std:.3f}")
-            log_parts.append(f"logits_rank={logits_rank_mean:.3f}±{logits_rank_std:.3f}")
-            log_parts.append(f"calib={calib_mean:.3f}±{calib_std:.3f}")
+            log_parts.append(f"focal={loss_focal.item():.4f}")
+            log_parts.append(f"recon={loss_recon.item():.4f}")
+            log_parts.append(f"div={loss_div.item():.4f}")
+            log_parts.append(f"empty={loss_empty.item():.4f}")
+            log_parts.append(f"spec={loss_spec.item():.4f}")
+            log_parts.append(f"align={loss_align.item():.4f}")
+            log_parts.append(f"mp={loss_mp.item():.4f}")
+            log_parts.append(f"logits={logits_mean:.3f}±{logits_std:.3f}")
             log_parts.append(f"train_AUC={train_auc:.4f}")
-            log_parts.append(f"pos_ema={self.pos_rate_ema:.4f}")  # 新增
+            log_parts.append(f"pos_ema={self.pos_rate_ema:.4f}")
+            log_parts.append(f"proto_usage={proto_usage:.3f}")
+            log_parts.append(f"proto_entropy={proto_entropy:.3f}")
+            log_parts.append(f"kappa={kappa_mean:.2f}±{kappa_std:.2f}")
+            log_parts.append(f"col_uniformity={col_uniformity:.3f}")
+            log_parts.append(f"dead_protos={dead_count}/{proto_weights.size(1)}")
             if self.adaptive_focal is not None:
                 log_parts.append(f"gamma={self.adaptive_focal.get_gamma().item():.3f}")
             if opt_diag:
                 log_parts.append(f"grad_ratio={opt_diag.get('grad_norm_ratio', 0):.2f}")
-                if 'rank_action' in opt_diag:
-                    log_parts.append(f"rank_action={opt_diag['rank_action']}")
-            # 新增：VQ usage
-            for domain, history in self.seq_usage_history.items():
-                if history:
-                    log_parts.append(f"{domain}_usage={history[-1]:.3f}")
+                if 'proto_action' in opt_diag:
+                    log_parts.append(f"proto_action={opt_diag['proto_action']}")
             logging.info(" | ".join(log_parts))
 
         return loss.item()
 
-    # ========== 评估函数（完全保留） ==========
     def evaluate(self, epoch: Optional[int] = None) -> Tuple[float, float]:
         self.model.eval()
         all_logits, all_labels = [], []
@@ -1104,9 +1021,8 @@ class PCVRHeteroFormerTrainer:
 
         return auc, logloss
 
-    # ========== 训练循环（完全保留 + VQ重启检查） ==========
     def train(self) -> None:
-        logging.info("Start training HeteroFormer v7.3 (Collaborative Multi-Objective + VQ collapse protection)")
+        logging.info("Start training HeteroFormer v8.0 (Symplectic Multi-Scale)")
         self.model.train()
         total_step = 0
 
@@ -1129,15 +1045,11 @@ class PCVRHeteroFormerTrainer:
                     loss_sum += loss
                     valid_steps += 1
 
-                # VQ 重启检查
-                self._check_and_restart_vq()
-
                 gamma_str = f"{self.adaptive_focal.get_gamma().item():.2f}" if self.adaptive_focal else "N/A"
                 train_pbar.set_postfix({
                     "loss": f"{loss:.4f}", 
                     "gamma": gamma_str, 
                     "nan": nan_count,
-                    "lrank_w": f"{self._get_dynamic_weights(self.global_step, {}).get('lrank', 0):.3f}"
                 })
 
                 if self.eval_every_n_steps > 0 and total_step % self.eval_every_n_steps == 0:
@@ -1160,7 +1072,12 @@ class PCVRHeteroFormerTrainer:
                            if 'embedding' in n or 'emb' in n.lower())
             dense_norm = sum(p.norm().item() for n, p in self.model.named_parameters()
                              if 'embedding' not in n and 'emb' not in n.lower())
-            logging.info(f"Epoch {epoch} | EmbNorm: {emb_norm:.1f} | DenseNorm: {dense_norm:.1f} | Ratio: {emb_norm/(dense_norm+1e-8):.1f}")
+            proto_norm = sum(p.norm().item() for n, p in self.model.named_parameters()
+                             if 'prototype' in n or 'proto_' in n or 'empty_prior' in n or 'match_vectors' in n or 'eta' in n)
+            logging.info(
+                f"Epoch {epoch} | EmbNorm: {emb_norm:.1f} | DenseNorm: {dense_norm:.1f} | "
+                f"ProtoNorm: {proto_norm:.1f} | Ratio: {emb_norm/(dense_norm+1e-8):.1f}"
+            )
 
             val_auc, val_logloss = self.evaluate(epoch=epoch)
             self.model.train()

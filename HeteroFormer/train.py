@@ -1,4 +1,4 @@
-"""HeteroFormer training entry point for TAAC2026 — v7.3."""
+"""HeteroFormer training entry point — v8.0-symplectic (Symplectic Multi-Scale Prototype Learning)."""
 
 import os
 import json
@@ -17,6 +17,7 @@ from trainer import PCVRHeteroFormerTrainer
 if hasattr(torch, 'compiler'):
     torch.compiler.reset()
 
+
 def build_feature_specs(
     schema: FeatureSchema,
     per_position_vocab_sizes: List[int],
@@ -29,7 +30,7 @@ def build_feature_specs(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="HeteroFormer Training for TAAC2026")
+    parser = argparse.ArgumentParser(description="HeteroFormer Training v8.0-symplectic")
 
     parser.add_argument('--data_dir', type=str, default=None)
     parser.add_argument('--schema_path', type=str, default=None)
@@ -78,11 +79,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--item_ns_tokens', type=int, default=0)
     parser.add_argument('--emb_skip_threshold', type=int, default=0)
 
-    parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'])
+    parser.add_argument('--loss_type', type=str, default='focal', choices=['bce', 'focal'])
     parser.add_argument('--focal_alpha', type=float, default=0.1)
     parser.add_argument('--focal_gamma', type=float, default=2.0)
 
-    parser.add_argument('--sparse_lr', type=float, default=0.01)
+    parser.add_argument('--sparse_lr', type=float, default=0.05)
+    parser.add_argument('--sparse_weight_decay', type=float, default=1e-4)
     parser.add_argument('--reinit_sparse_after_epoch', type=int, default=1)
     parser.add_argument('--reinit_cardinality_threshold', type=int, default=0)
 
@@ -97,26 +99,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--no_adaptive_focal', dest='use_adaptive_focal', action='store_false')
     parser.add_argument('--enable_progressive_layers', action='store_true', default=False)
     parser.add_argument('--stochastic_depth_prob', type=float, default=0.1)
-    parser.add_argument('--sparse_weight_decay', type=float, default=1e-4)
     parser.add_argument('--id_dropout_rate', type=float, default=0.15)
     parser.add_argument('--seq_id_dropout_rate', type=float, default=0.10)
     parser.add_argument('--id_vocab_threshold', type=int, default=10000)
 
     parser.add_argument('--label_smoothing_strategy', type=str, default='hybrid',
                         choices=['none', 'hybrid', 'anneal'])
-    parser.add_argument('--label_smoothing_max_eps', type=float, default=0.02)
+    parser.add_argument('--label_smoothing_max_eps', type=float, default=0.05)
     parser.add_argument('--label_smoothing_min_eps', type=float, default=0.001)
     parser.add_argument('--label_smoothing_anneal_steps', type=int, default=2000)
 
     parser.add_argument('--shrinkage', type=float, default=0.05)
-
-    parser.add_argument('--zmlc_lambda', type=float, default=0.05)
     parser.add_argument('--cross_network_layers', type=int, default=2)
 
-    parser.add_argument('--gse_num_codes', type=int, default=64)
-    parser.add_argument('--gse_code_dim', type=int, default=64)
-    parser.add_argument('--gse_num_layers', type=int, default=4)
-    parser.add_argument('--gse_aux_weight', type=float, default=0.3)
+    # === v8.0-symplectic: Prototype Architecture ===
+    parser.add_argument('--num_codes', type=int, default=64,
+                        help='Number of prototype codes (interest prototypes)')
+    # v8.0: epsilon默认0.05 (v7.4是0.1)，更小的熵正则=更硬的分配
+    parser.add_argument('--sinkhorn_epsilon', type=float, default=0.05,
+                        help='Entropy regularization for Sinkhorn (smaller=harder allocation)')
+    parser.add_argument('--sinkhorn_iter', type=int, default=20,
+                        help='Sinkhorn iteration steps')
+    # v8.0: min_mass_ratio默认1/64≈0.016 (v7.4是0.05)，真正的均匀分配临界值
+    parser.add_argument('--min_mass_ratio', type=float, default=0.016,
+                        help='Minimum mass ratio per prototype (1/K for uniform)')
+
+    # === v8.0-symplectic: Curriculum Learning ===
+    parser.add_argument('--curriculum_warmup', type=int, default=5000,
+                        help='Steps for curriculum learning warmup (recon first, then structure)')
 
     parser.add_argument('--compile_backend', type=str, default='inductor')
     parser.add_argument('--compile_mode', type=str, default='reduce-overhead')
@@ -127,22 +137,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--focal_alpha_pos', type=float, default=0.6)
     parser.add_argument('--focal_alpha_neg', type=float, default=0.4)
     parser.add_argument('--focal_max_gamma', type=float, default=4.0)
-    parser.add_argument('--prior_weight', type=float, default=0.001)
-    parser.add_argument('--ece_weight', type=float, default=0.05)
-    parser.add_argument('--lambdarank_weight', type=float, default=0.1)
     parser.add_argument('--global_ctr', type=float, default=0.01)
-
-    # NEW: v7.3 collaborative optimization parameters
-    parser.add_argument('--zmlc_on_calib_only', action='store_true', default=True,
-                        help='ZMLC only constrains calibration residual (recommended)')
-    parser.add_argument('--rank_lr_multiplier', type=float, default=2.0,
-                        help='Learning rate multiplier for rank head')
-    parser.add_argument('--calib_lr_multiplier', type=float, default=1.0,
-                        help='Learning rate multiplier for calibrator')
-    parser.add_argument('--enable_grad_conflict_check', action='store_true', default=True,
-                        help='Enable gradient conflict detection and resolution')
-    parser.add_argument('--loss_conflict_threshold', type=float, default=0.8,
-                        help='Cosine similarity threshold for gradient conflict')
 
     args = parser.parse_args()
 
@@ -245,14 +240,11 @@ def main() -> None:
         "id_vocab_threshold": args.id_vocab_threshold,
         "shrinkage": args.shrinkage,
         "cross_network_layers": args.cross_network_layers,
-        "use_zmlc": args.zmlc_lambda > 0.0,
-        "zmlc_lambda": args.zmlc_lambda,
-        "gse_num_codes": args.gse_num_codes,
-        "gse_code_dim": args.gse_code_dim,
-        "gse_num_layers": args.gse_num_layers,
-        # NEW: v7.3 params
-        "rank_head_hidden_dim": args.d_model,
-        "calib_residual_scale": 0.1,
+        # v8.0-symplectic
+        "num_codes": args.num_codes,
+        "sinkhorn_epsilon": args.sinkhorn_epsilon,
+        "sinkhorn_iter": args.sinkhorn_iter,
+        "min_mass_ratio": args.min_mass_ratio,
     }
 
     model = PCVRHeteroFormer(**model_args).to(args.device)
@@ -261,41 +253,38 @@ def main() -> None:
         import torch._dynamo
         torch._dynamo.config.suppress_errors = True
         logging.info("Dynamo suppress_errors enabled")
-        
+
     if args.device == 'cuda' and hasattr(torch, 'compile'):
         try:
             compile_kwargs = {
-                "backend": args.compile_backend, 
-                "fullgraph": False,
+                "backend": args.compile_backend,
+                "fullgraph": False,  # v8.0理论上支持fullgraph，但建议先False验证
                 "dynamic": args.compile_dynamic,
                 "mode": args.compile_mode,
             }
             model = torch.compile(model, **compile_kwargs)
-            logging.info(f"torch.compile enabled (conservative): {compile_kwargs}")
+            logging.info(f"torch.compile enabled: {compile_kwargs}")
         except Exception as e:
             logging.warning(f"torch.compile failed: {e}, falling back to eager mode")
 
     total_params = sum(p.numel() for p in model.parameters())
-    emb_params = sum(p.numel() for n, p in model.named_parameters() 
+    emb_params = sum(p.numel() for n, p in model.named_parameters()
                      if 'embedding' in n or 'emb' in n.lower())
     dense_params = total_params - emb_params
-    rank_params = sum(p.numel() for n, p in model.named_parameters() if 'rank_' in n or 'rank_predictor' in n)
-    calib_params = sum(p.numel() for n, p in model.named_parameters() if 'calibrator' in n)
-    
-    logging.info(f"PCVRHeteroFormer v7.3 (Collaborative Multi-Objective)")
-    logging.info(f"GSE config: num_codes={args.gse_num_codes}, code_dim={args.gse_code_dim}, layers={args.gse_num_layers}")
+    # v8.0: 新增 'eta' 到原型参数统计
+    proto_params = sum(p.numel() for n, p in model.named_parameters()
+                       if 'prototype' in n or 'proto_' in n or 'empty_prior' in n
+                       or 'match_vectors' in n or 'eta' in n)
+
+    logging.info(f"PCVRHeteroFormer v8.0-symplectic (Symplectic Multi-Scale Prototype Learning)")
+    logging.info(f"Prototype config: num_codes={args.num_codes}, "
+                 f"sinkhorn_eps={args.sinkhorn_epsilon}, sinkhorn_iter={args.sinkhorn_iter}, "
+                 f"min_mass_ratio={args.min_mass_ratio}")
+    logging.info(f"Curriculum warmup: {args.curriculum_warmup} steps")
     logging.info(f"Total parameters: {total_params:,} | Embedding: {emb_params:,} | Dense: {dense_params:,}")
-    logging.info(f"Rank head: {rank_params:,} | Calibrator: {calib_params:,}")
-    
-    if args.base_rank is not None and args.base_rank < args.d_model // 2:
-        logging.warning(
-            f"MATH WARNING: base_rank={args.base_rank} < d_model/2={args.d_model//2}. "
-            f"Low-rank bottleneck may cause insufficient representation."
-        )
+    logging.info(f"Prototype params: {proto_params:,}")
     logging.info(f"Embedding/Dense ratio: {emb_params/max(dense_params,1):.1f}")
     logging.info(f"Rank schedule: {model.ranks}")
-    logging.info(f"Shrinkage: {args.shrinkage}")
-    logging.info(f"ZMLC mode: {'calib_only' if args.zmlc_on_calib_only else 'full_logits'}")
 
     early_stopping = EarlyStopping(
         checkpoint_path=os.path.join(args.ckpt_dir, "placeholder", "model.pt"),
@@ -341,21 +330,18 @@ def main() -> None:
         label_smoothing_max_eps=args.label_smoothing_max_eps,
         label_smoothing_min_eps=args.label_smoothing_min_eps,
         label_smoothing_anneal_steps=args.label_smoothing_anneal_steps,
-        gse_aux_weight=args.gse_aux_weight,
         focal_alpha_pos=args.focal_alpha_pos,
         focal_alpha_neg=args.focal_alpha_neg,
         focal_max_gamma=args.focal_max_gamma,
-        prior_weight=args.prior_weight,
-        ece_weight=args.ece_weight,
-        lambdarank_weight=args.lambdarank_weight,
         global_ctr=args.global_ctr,
-        zmlc_lambda=args.zmlc_lambda,
-        # NEW: v7.3 collaborative params
-        zmlc_on_calib_only=args.zmlc_on_calib_only,
-        rank_lr_multiplier=args.rank_lr_multiplier,
-        calib_lr_multiplier=args.calib_lr_multiplier,
-        enable_grad_conflict_check=args.enable_grad_conflict_check,
-        loss_conflict_threshold=args.loss_conflict_threshold,
+        # v8.0-symplectic: Loss weights
+        recon_weight=0.1,
+        div_weight=0.15,
+        empty_weight=0.1,
+        spec_weight=0.01,
+        align_weight=0.05,
+        mp_weight=0.005,
+        curriculum_warmup=args.curriculum_warmup,
     )
 
     trainer.train()
