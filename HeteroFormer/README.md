@@ -154,18 +154,6 @@ TensorBoard新增监控:
 - `Curriculum/alpha`: 课程学习进度
 - `Curriculum/weight_*`: 动态损失权重
 
-## 与v7.4的关键差异
-
-| 维度 | v7.4 | v8.0 |
-|------|------|------|
-| 原型空间 | 欧氏空间 | vMF球面 |
-| Sinkhorn约束 | 错误实现 | 正确对偶上升 |
-| 谱正则 | SVD直接优化 | MP分布约束 |
-| 任务优化 | 简单加权 | 辛约化分解 |
-| 序列编码 | Transformer O(n²) | 线性注意力 O(n) |
-| 分支融合 | 静态相加 | 门控+对比对齐 |
-| 特征交互 | Bilinear/Attention | Hamiltonian动力学 |
-
 ## 使用示例
 
 ```python
