@@ -1,4 +1,4 @@
-"""HeteroFormer training entry point — v8.0-symplectic (Symplectic Multi-Scale Prototype Learning)."""
+"""HeteroFormer training entry point — v8.1-zero-hessian (Zero-Hessian Symplectic Prototype Learning)."""
 
 import os
 import json
@@ -30,7 +30,7 @@ def build_feature_specs(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="HeteroFormer Training v8.0-symplectic")
+    parser = argparse.ArgumentParser(description="HeteroFormer Training v8.1-zero-hessian")
 
     parser.add_argument('--data_dir', type=str, default=None)
     parser.add_argument('--schema_path', type=str, default=None)
@@ -112,21 +112,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--shrinkage', type=float, default=0.05)
     parser.add_argument('--cross_network_layers', type=int, default=2)
 
-    # === v8.0-symplectic: Prototype Architecture ===
+    # === v8.1: Prototype Architecture ===
     parser.add_argument('--num_codes', type=int, default=64,
                         help='Number of prototype codes (interest prototypes)')
-    # v8.0: epsilon默认0.05 (v7.4是0.1)，更小的熵正则=更硬的分配
     parser.add_argument('--sinkhorn_epsilon', type=float, default=0.05,
-                        help='Entropy regularization for Sinkhorn (smaller=harder allocation)')
+                        help='Entropy regularization for Sinkhorn')
     parser.add_argument('--sinkhorn_iter', type=int, default=20,
                         help='Sinkhorn iteration steps')
-    # v8.0: min_mass_ratio默认1/64≈0.016 (v7.4是0.05)，真正的均匀分配临界值
     parser.add_argument('--min_mass_ratio', type=float, default=0.016,
                         help='Minimum mass ratio per prototype (1/K for uniform)')
+    parser.add_argument('--coherence_threshold', type=float, default=0.1,
+                        help='Grassmannian packing coherence threshold')
 
-    # === v8.0-symplectic: Curriculum Learning ===
+    # === v8.1: Curriculum Learning ===
     parser.add_argument('--curriculum_warmup', type=int, default=5000,
-                        help='Steps for curriculum learning warmup (recon first, then structure)')
+                        help='Steps for curriculum learning warmup')
 
     parser.add_argument('--compile_backend', type=str, default='inductor')
     parser.add_argument('--compile_mode', type=str, default='reduce-overhead')
@@ -240,11 +240,12 @@ def main() -> None:
         "id_vocab_threshold": args.id_vocab_threshold,
         "shrinkage": args.shrinkage,
         "cross_network_layers": args.cross_network_layers,
-        # v8.0-symplectic
+        # v8.1
         "num_codes": args.num_codes,
         "sinkhorn_epsilon": args.sinkhorn_epsilon,
         "sinkhorn_iter": args.sinkhorn_iter,
         "min_mass_ratio": args.min_mass_ratio,
+        "coherence_threshold": args.coherence_threshold,
     }
 
     model = PCVRHeteroFormer(**model_args).to(args.device)
@@ -258,7 +259,7 @@ def main() -> None:
         try:
             compile_kwargs = {
                 "backend": args.compile_backend,
-                "fullgraph": False,  # v8.0理论上支持fullgraph，但建议先False验证
+                "fullgraph": False,
                 "dynamic": args.compile_dynamic,
                 "mode": args.compile_mode,
             }
@@ -271,15 +272,14 @@ def main() -> None:
     emb_params = sum(p.numel() for n, p in model.named_parameters()
                      if 'embedding' in n or 'emb' in n.lower())
     dense_params = total_params - emb_params
-    # v8.0: 新增 'eta' 到原型参数统计
     proto_params = sum(p.numel() for n, p in model.named_parameters()
                        if 'prototype' in n or 'proto_' in n or 'empty_prior' in n
                        or 'match_vectors' in n or 'eta' in n)
 
-    logging.info(f"PCVRHeteroFormer v8.0-symplectic (Symplectic Multi-Scale Prototype Learning)")
+    logging.info(f"PCVRHeteroFormer v8.1-zero-hessian")
     logging.info(f"Prototype config: num_codes={args.num_codes}, "
                  f"sinkhorn_eps={args.sinkhorn_epsilon}, sinkhorn_iter={args.sinkhorn_iter}, "
-                 f"min_mass_ratio={args.min_mass_ratio}")
+                 f"min_mass_ratio={args.min_mass_ratio}, coherence_threshold={args.coherence_threshold}")
     logging.info(f"Curriculum warmup: {args.curriculum_warmup} steps")
     logging.info(f"Total parameters: {total_params:,} | Embedding: {emb_params:,} | Dense: {dense_params:,}")
     logging.info(f"Prototype params: {proto_params:,}")
@@ -334,13 +334,11 @@ def main() -> None:
         focal_alpha_neg=args.focal_alpha_neg,
         focal_max_gamma=args.focal_max_gamma,
         global_ctr=args.global_ctr,
-        # v8.0-symplectic: Loss weights
+        # v8.1
         recon_weight=0.1,
         div_weight=0.15,
         empty_weight=0.1,
-        spec_weight=0.01,
-        align_weight=0.05,
-        mp_weight=0.005,
+        packing_weight=0.01,
         curriculum_warmup=args.curriculum_warmup,
     )
 

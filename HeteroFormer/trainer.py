@@ -1,15 +1,12 @@
 """
-PCVRHeteroFormer Trainer v8.0 - Symplectic Multi-Scale Optimization
-====================================================================
-基于辛约化的多任务训练动力学。
+PCVRHeteroFormer Trainer v8.1-patch2 - Zero-Hessian Multi-Scale Optimization
+============================================================================
+修复 (v8.1-patch1 → v8.1-patch2):
+1. 接收 model.forward 返回的 kappa_loss
+2. 将 kappa_loss 加入总 loss（权重 0.1）
+3. 添加 TensorBoard 日志: Loss/kappa, Proto/kappa_var
 
-核心创新:
-1. 辛约化梯度流: 通过守恒量消除任务冲突
-2. 多尺度分解: 低频大步 + 高频小步，避免振荡
-3. 课程学习: 先重构后结构化，平滑损失景观
-4. 自然梯度: Fisher信息矩阵作为黎曼度量
-
-Author: v8.0-symplectic
+Author: v8.1-patch2
 Date: 2026-05-09
 """
 
@@ -34,7 +31,7 @@ import math
 
 
 # ==============================================================================
-# Adaptive Focal Loss (preserved, enhanced)
+# Adaptive Focal Loss (preserved)
 # ==============================================================================
 
 class AdaptiveFocalLoss(nn.Module):
@@ -98,23 +95,10 @@ class AdaptiveFocalLoss(nn.Module):
 
 
 # ==============================================================================
-# Symplectic Multi-Scale Optimizer
+# Multi-Scale Optimizer (零SVD)
 # ==============================================================================
 
-class SymplecticMultiScaleOptimizer:
-    """
-    辛约化多尺度优化器。
-
-    理论框架:
-    - 将损失分解为低频(平滑)和高频(粗糙)成分
-    - 低频成分定义慢流形，用较大学习率优化
-    - 高频成分在正交补空间中优化，用较小学习率
-    - 通过守恒量约束消除任务冲突
-
-    任务频率分类:
-    - low: focal, recon (大尺度结构)
-    - high: div, spec, empty, align (精细调整)
-    """
+class MultiScaleOptimizer:
     def __init__(
         self,
         sparse_optimizer: torch.optim.Optimizer,
@@ -140,16 +124,6 @@ class SymplecticMultiScaleOptimizer:
         self._dense_norm_history = deque(maxlen=adapt_interval)
         self._proto_norm_history = deque(maxlen=adapt_interval)
 
-        # 任务频率映射
-        self.task_frequency = {
-            'focal': 'low',
-            'recon': 'low', 
-            'div': 'high',
-            'spec': 'high',
-            'empty': 'high',
-            'align': 'high',
-        }
-
     def zero_grad(self) -> None:
         self.sparse_opt.zero_grad()
         self.dense_opt.zero_grad()
@@ -158,120 +132,14 @@ class SymplecticMultiScaleOptimizer:
         if self.proto_opt is not None:
             self.proto_opt.zero_grad()
 
-    def _compute_task_gradients(self, model: nn.Module, task_losses: Dict[str, torch.Tensor]) -> Dict[str, List[torch.Tensor]]:
-        """
-        分别计算每个任务的梯度。
-
-        Returns:
-            task_grads: {task_name: [grad_for_param1, grad_for_param2, ...]}
-        """
-        task_grads = {}
-
-        for task_name, loss in task_losses.items():
-            # 清空梯度
-            model.zero_grad()
-
-            # 反向传播
-            loss.backward(retain_graph=True)
-
-            # 收集梯度
-            grads = []
-            for p in model.parameters():
-                if p.grad is not None:
-                    grads.append(p.grad.clone().flatten())
-                else:
-                    grads.append(torch.zeros_like(p.flatten()))
-
-            task_grads[task_name] = grads
-
-        return task_grads
-
-    def _symplectic_reduction(self, task_grads: Dict[str, List[torch.Tensor]], 
-                              task_losses: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        辛约化: 将任务梯度分解为低频和高频成分。
-
-        数学:
-        1. 构建梯度矩阵 G = [g_1, ..., g_K]
-        2. SVD分解: G = U S V^T
-        3. 低频成分 = U[:, :r] @ U[:, :r]^T @ g_total (大奇异值)
-        4. 高频成分 = g_total - g_low (小奇异值)
-        """
-        # 展平所有梯度
-        task_names = list(task_grads.keys())
-        num_params = len(task_grads[task_names[0]])
-
-        # 构建梯度矩阵 [num_params_total, K]
-        grad_matrix = []
-        for task_name in task_names:
-            flat_grad = torch.cat(task_grads[task_name])
-            grad_matrix.append(flat_grad)
-
-        G = torch.stack(grad_matrix, dim=1)  # [d, K]
-
-        # 总梯度
-        g_total = G.sum(dim=1)  # [d]
-
-        # SVD分解 (低秩近似)
-        try:
-            U, S, Vh = torch.linalg.svd(G, full_matrices=False)
-
-            # 自适应截断: 保留累积奇异值90%的成分
-            cumsum = torch.cumsum(S, dim=0)
-            total = cumsum[-1] + 1e-8
-            r = (cumsum / total < 0.9).sum().item() + 1
-            r = min(r, len(S) - 1)
-            r = max(r, 1)
-
-            # 低频投影
-            U_low = U[:, :r]  # [d, r]
-            g_low = U_low @ (U_low.T @ g_total)  # [d]
-
-        except:
-            # SVD失败时回退到简单平均
-            g_low = g_total.clone()
-
-        # 高频成分 = 总梯度 - 低频投影
-        g_high = g_total - g_low
-
-        return g_low, g_high
-
-    def _apply_reduced_gradients(self, model: nn.Module, g_low: torch.Tensor, g_high: torch.Tensor):
-        """
-        应用约化后的梯度，使用不同学习率。
-        """
-        # 组合梯度: 低频大步 + 高频小步
-        g_combined = g_low + self.high_lr_scale * g_high
-
-        # 重新塑形并设置梯度
-        offset = 0
-        for p in model.parameters():
-            numel = p.numel()
-            p.grad = g_combined[offset:offset+numel].view_as(p)
-            offset += numel
-
-    def step(self, model: nn.Module, task_losses: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, float]:
-        """
-        辛约化优化步骤。
-
-        Args:
-            model: 模型
-            task_losses: 各任务的损失字典 {task_name: loss_tensor}
-        """
+    def step(self, model: nn.Module) -> Dict[str, float]:
         self.step_count += 1
 
-        if task_losses is not None and len(task_losses) > 1:
-            # 多任务辛约化
-            task_grads = self._compute_task_gradients(model, task_losses)
-            g_low, g_high = self._symplectic_reduction(task_grads, task_losses)
-            self._apply_reduced_gradients(model, g_low, g_high)
-
-        # 标准优化器步骤
         sparse_norms, dense_norms, proto_norms = [], [], []
 
         for name, p in model.named_parameters():
             if p.grad is not None:
-                if 'prototype' in name or 'proto_' in name or 'empty_prior' in name or 'match_vectors' in name or 'eta' in name:
+                if 'prototype' in name or 'proto_' in name or 'empty_prior' in name or 'match_vectors' in name or 'eta' in name or 'kappa_log' in name:
                     proto_norms.append(p.grad.norm())
                 elif 'embedding' in name or 'emb' in name.lower():
                     sparse_norms.append(p.grad.norm())
@@ -293,7 +161,6 @@ class SymplecticMultiScaleOptimizer:
             'grad_norm_ratio': sparse_norm / (dense_norm + 1e-8),
         }
 
-        # 自适应学习率调整
         if self.step_count % self.adapt_interval == 0:
             avg_sparse = np.mean(self._sparse_norm_history)
             avg_dense = np.mean(self._dense_norm_history)
@@ -316,7 +183,6 @@ class SymplecticMultiScaleOptimizer:
                         g['lr'] *= 1.2
                 diag['proto_action'] = 'boosted_proto_lr'
 
-        # 梯度裁剪
         if len(self._sparse_norm_history) >= self.adapt_interval:
             avg_sparse = np.mean(self._sparse_norm_history)
             if sparse_norm > 5.0 * avg_sparse:
@@ -326,7 +192,6 @@ class SymplecticMultiScaleOptimizer:
                             p.grad.mul_(avg_sparse / (sparse_norm + 1e-8))
                 diag['sparse_grad_rescaled'] = True
 
-        # 优化器步骤
         self.sparse_opt.step()
         self.dense_opt.step()
         if self.gate_opt is not None:
@@ -359,7 +224,7 @@ class SymplecticMultiScaleOptimizer:
 
 
 # ==============================================================================
-# Trainer v8.0
+# Trainer v8.1-patch2
 # ==============================================================================
 
 class PCVRHeteroFormerTrainer:
@@ -400,14 +265,10 @@ class PCVRHeteroFormerTrainer:
         focal_alpha_neg: float = 0.5,
         focal_max_gamma: float = 4.0,
         global_ctr: float = 0.01,
-        # v8.0: Symplectic Loss weights
         recon_weight: float = 0.1,
         div_weight: float = 0.15,
         empty_weight: float = 0.1,
-        spec_weight: float = 0.01,
-        align_weight: float = 0.05,
-        mp_weight: float = 0.005,
-        # v8.0: Curriculum learning
+        packing_weight: float = 0.01,
         curriculum_warmup: int = 5000,
     ) -> None:
         self.model = model
@@ -432,17 +293,13 @@ class PCVRHeteroFormerTrainer:
         self.pos_rate_ema = global_ctr
         self.global_ctr = global_ctr
 
-        # v8.0: Loss weights
         self.recon_weight = recon_weight
         self.div_weight = div_weight
         self.empty_weight = empty_weight
-        self.spec_weight = spec_weight
-        self.align_weight = align_weight
-        self.mp_weight = mp_weight
+        self.packing_weight = packing_weight
 
-        self._loss_history = {'focal': [], 'recon': [], 'div': [], 'empty': [], 'spec': [], 'align': [], 'mp': []}
+        self._loss_history = {'focal': [], 'recon': [], 'div': [], 'empty': [], 'packing': []}
 
-        # 优化器构建
         if hasattr(model, 'get_sparse_params') and use_grafted_optimizer:
             sparse_params = model.get_sparse_params()
             dense_params = model.get_dense_params()
@@ -466,7 +323,7 @@ class PCVRHeteroFormerTrainer:
                 weight_decay=1e-3
             ) if proto_params else None
 
-            self.optimizer = SymplecticMultiScaleOptimizer(
+            self.optimizer = MultiScaleOptimizer(
                 sparse_opt, dense_opt, gate_opt, proto_opt,
                 target_ratio=1.0, adapt_interval=200,
                 low_lr_scale=1.0, high_lr_scale=0.1,
@@ -514,7 +371,7 @@ class PCVRHeteroFormerTrainer:
             self.focal_alpha = focal_alpha
             self.focal_gamma = focal_gamma
             logging.info(
-                f"v8.0 AdaptiveFocalLoss: max_gamma={focal_max_gamma}, "
+                f"v8.1-patch2 AdaptiveFocalLoss: max_gamma={focal_max_gamma}, "
                 f"alpha_pos={focal_alpha_pos}, alpha_neg={focal_alpha_neg}"
             )
         else:
@@ -526,40 +383,28 @@ class PCVRHeteroFormerTrainer:
             logging.info(f"Warmup: {warmup_steps} steps")
 
         logging.info(
-            f"v8.0 Symplectic Loss: recon={recon_weight}, div={div_weight}, "
-            f"empty={empty_weight}, spec={spec_weight}, align={align_weight}, mp={mp_weight}"
+            f"v8.1-patch2 Loss: recon={recon_weight}, div={div_weight}, "
+            f"empty={empty_weight}, packing={packing_weight}"
         )
         logging.info(f"Curriculum warmup: {curriculum_warmup} steps")
 
     def _get_dynamic_weights(self, global_step: int) -> Dict[str, float]:
-        """
-        课程学习: 动态调整损失权重。
-
-        前curriculum_warmup步:
-        - recon权重保持，div/spec逐渐引入
-        之后:
-        - 所有权重达到目标值
-        """
         if global_step < self.curriculum_warmup:
             alpha = global_step / max(self.curriculum_warmup, 1)
-            alpha_sq = alpha * alpha  # 二次缓增
+            alpha_sq = alpha * alpha
 
             return {
                 'recon': self.recon_weight,
                 'div': self.div_weight * alpha_sq,
-                'spec': self.spec_weight * alpha,
                 'empty': self.empty_weight * alpha,
-                'align': self.align_weight * alpha,
-                'mp': self.mp_weight * alpha,
+                'packing': self.packing_weight * alpha,
             }
 
         return {
             'recon': self.recon_weight,
             'div': self.div_weight,
-            'spec': self.spec_weight,
             'empty': self.empty_weight,
-            'align': self.align_weight,
-            'mp': self.mp_weight,
+            'packing': self.packing_weight,
         }
 
     def _smooth_labels(self, labels: torch.Tensor) -> torch.Tensor:
@@ -717,15 +562,15 @@ class PCVRHeteroFormerTrainer:
 
         model_input = self._make_model_input(device_batch)
 
-        # v8.0: 新的forward返回6个值
-        logits, seq_feat, proto_weights, proto_repr, align_loss, log_det = self.model(model_input)
+        # patch2: 接收 8 个返回值（新增 kappa_loss）
+        logits, seq_feat, proto_weights, proto_repr, kappa_mean, packing_loss, proto_ctr, kappa_loss = self.model(model_input)
         logits = logits.squeeze(-1)
 
         if torch.isnan(logits).any() or torch.isinf(logits).any():
             logging.warning(f"NaN/Inf in logits at step {self.global_step}, skipping batch")
             return float('nan')
 
-        # ===== 1. Focal Loss (low frequency) =====
+        # ===== 1. Focal Loss =====
         if self.adaptive_focal is not None:
             loss_focal = self.adaptive_focal(logits, labels_smooth)
         elif self.loss_type == 'focal':
@@ -740,10 +585,12 @@ class PCVRHeteroFormerTrainer:
         else:
             loss_focal = F.binary_cross_entropy_with_logits(logits, labels_smooth)
 
-        # ===== 2. Prototype Reconstruction (low frequency) =====
-        loss_recon = F.mse_loss(proto_repr, seq_feat)
+        # ===== 2. vMF Reconstruction Loss (余弦对齐) =====
+        seq_feat_norm = F.normalize(seq_feat, p=2, dim=-1)
+        proto_repr_norm = F.normalize(proto_repr, p=2, dim=-1)
+        loss_recon = -(seq_feat_norm * proto_repr_norm).sum(dim=-1).mean()
 
-        # ===== 3. Prototype Diversity (high frequency) =====
+        # ===== 3. Prototype Diversity =====
         weighted_pos = (proto_weights * labels.unsqueeze(1)).sum(dim=0)
         weighted_total = proto_weights.sum(dim=0)
         proto_ctr_est = weighted_pos / (weighted_total + 1e-8)
@@ -761,7 +608,7 @@ class PCVRHeteroFormerTrainer:
         death_ratio = 1.0 - active_mask.mean()
         loss_div = -var_active + 0.2 * death_ratio
 
-        # ===== 4. Empty Calibration (high frequency) =====
+        # ===== 4. Empty Calibration =====
         first_domain = list(device_batch['_seq_domains'])[0] if len(device_batch['_seq_domains']) > 0 else None
         if first_domain is not None:
             seq_lens = device_batch[f'{first_domain}_len']
@@ -773,34 +620,22 @@ class PCVRHeteroFormerTrainer:
         else:
             loss_empty = torch.tensor(0.0, device=self.device)
 
-        # ===== 5. vMF Volume (high frequency) =====
-        loss_spec = -log_det  # 最大化体积
+        # ===== 5. Grassmannian Packing Loss =====
+        loss_packing = packing_loss
 
-        # ===== 6. MP Spectral Regularization (high frequency) =====
-        if hasattr(self.model, 'mp_regularizer'):
-            first_proto_vq = list(self.model.prototype_vqs.values())[0] if len(self.model.prototype_vqs) > 0 else None
-            if first_proto_vq is not None:
-                mu, _ = first_proto_vq.get_prototypes()
-                loss_mp = self.model.mp_regularizer(mu)
-            else:
-                loss_mp = torch.tensor(0.0, device=self.device)
-        else:
-            loss_mp = torch.tensor(0.0, device=self.device)
-
-        # ===== 7. Fusion Alignment (high frequency) =====
-        loss_align = align_loss
+        # ===== 6. Kappa Regularization (patch2) =====
+        loss_kappa = kappa_loss
 
         # ===== 动态权重 =====
         weights = self._get_dynamic_weights(self.global_step)
 
-        # ===== Total Loss =====
+        # ===== Total Loss (patch2: 加入 kappa_loss) =====
         loss = (loss_focal + 
                 weights['recon'] * loss_recon + 
                 weights['div'] * loss_div + 
                 weights['empty'] * loss_empty + 
-                weights['spec'] * loss_spec + 
-                weights['mp'] * loss_mp +
-                weights['align'] * loss_align)
+                weights['packing'] * loss_packing +
+                0.1 * loss_kappa)  # ← patch2 新增
 
         if torch.isnan(loss) or torch.isinf(loss):
             logging.warning(f"NaN/Inf loss at step {self.global_step}, skipping batch")
@@ -812,42 +647,38 @@ class PCVRHeteroFormerTrainer:
                     self.sparse_optimizer.zero_grad()
             return float('nan')
 
-        # v8.0: 辛约化优化
-        if self.optimizer is not None and hasattr(self.optimizer, '_symplectic_reduction'):
-            # 分别计算各任务损失
-            task_losses = {
-                'focal': loss_focal,
-                'recon': loss_recon,
-                'div': weights['div'] * loss_div,
-                'spec': weights['spec'] * loss_spec,
-                'empty': weights['empty'] * loss_empty,
-                'align': weights['align'] * loss_align,
-                'mp': weights['mp'] * loss_mp,
-            }
+        loss.backward()
 
-            # 使用辛约化优化器
-            opt_diag = self.optimizer.step(self.model, task_losses)
-        else:
-            # 回退到标准反向传播
-            loss.backward()
-            opt_diag = {}
+        # embedding梯度记录
+        emb_grad_norms = []
+        for name, p in self.model.named_parameters():
+            if p.grad is not None and ('embedding' in name or 'emb' in name.lower()):
+                ptr = p.data_ptr()
+                g_norm = p.grad.norm()
+                emb_grad_norms.append(g_norm)
+                if ptr not in self._emb_grad_history:
+                    self._emb_grad_history[ptr] = []
+                self._emb_grad_history[ptr].append(g_norm.detach())
+                if len(self._emb_grad_history[ptr]) > self._emb_death_threshold * 2:
+                    self._emb_grad_history[ptr] = self._emb_grad_history[ptr][-self._emb_death_threshold:]
+        total_emb_grad_norm = torch.stack(emb_grad_norms).norm().item() if emb_grad_norms else 0.0
+
+        # NaN梯度检查
+        has_nan_grad = False
+        grads = [p.grad for p in self.model.parameters() if p.grad is not None]
+        if grads:
+            flat_grads = torch.cat([g.flatten()[:1000] for g in grads])
+            has_nan_grad = torch.isnan(flat_grads).any() or torch.isinf(flat_grads).any()
+        if has_nan_grad:
             if self.optimizer is not None:
-                opt_diag = self.optimizer.step(self.model)
+                self.optimizer.zero_grad()
             else:
-                self.dense_optimizer.step()
+                self.dense_optimizer.zero_grad()
                 if self.sparse_optimizer is not None:
-                    self.sparse_optimizer.step()
+                    self.sparse_optimizer.zero_grad()
+            return float('nan')
 
-        if self.adaptive_focal is not None:
-            self.adaptive_focal.step()
-
-        # 更新loss history
-        for key, val in [('focal', loss_focal), ('recon', loss_recon), ('div', loss_div), 
-                          ('empty', loss_empty), ('spec', loss_spec), ('align', loss_align), ('mp', loss_mp)]:
-            self._loss_history[key].append(val.item())
-            if len(self._loss_history[key]) > 500:
-                self._loss_history[key] = self._loss_history[key][-500:]
-
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.global_step += 1
 
         # 学习率warmup
@@ -871,6 +702,25 @@ class PCVRHeteroFormerTrainer:
                     for g in self.sparse_optimizer.param_groups:
                         g['lr'] = self.sparse_lr * warmup_factor
 
+        # 优化器更新
+        opt_diag = {}
+        if self.optimizer is not None:
+            opt_diag = self.optimizer.step(self.model)
+        else:
+            self.dense_optimizer.step()
+            if self.sparse_optimizer is not None:
+                self.sparse_optimizer.step()
+
+        if self.adaptive_focal is not None:
+            self.adaptive_focal.step()
+
+        # 更新loss history
+        for key, val in [('focal', loss_focal), ('recon', loss_recon), ('div', loss_div), 
+                          ('empty', loss_empty), ('packing', loss_packing)]:
+            self._loss_history[key].append(val.item())
+            if len(self._loss_history[key]) > 500:
+                self._loss_history[key] = self._loss_history[key][-500:]
+
         # ===== TensorBoard 日志 =====
         with torch.no_grad():
             logits_mean = logits.mean().item()
@@ -883,27 +733,15 @@ class PCVRHeteroFormerTrainer:
             except Exception:
                 train_auc = 0.0
 
-            # 原型诊断
             proto_usage = (proto_weights.argmax(dim=-1) != 0).float().mean().item()
             proto_entropy = -(proto_weights * torch.log(proto_weights + 1e-10)).sum(dim=-1).mean().item()
             proto_max_freq = (proto_weights.argmax(dim=-1) == proto_weights.argmax(dim=-1).mode().values).float().mean().item()
 
-            # Sinkhorn列和均匀度
             col_sums = proto_weights.sum(dim=0)
             col_uniformity = 1.0 - (col_sums.std() / (col_sums.mean() + 1e-8))
 
-            # 死亡原型统计
             dead_count = (weighted_total < 1e-3).sum().item()
             alive_count = proto_weights.size(1) - dead_count
-
-            # v8.0: vMF集中度
-            if hasattr(self.model, 'prototype_vqs') and len(self.model.prototype_vqs) > 0:
-                first_vq = list(self.model.prototype_vqs.values())[0]
-                _, kappa = first_vq.get_prototypes()
-                kappa_mean = kappa.mean().item()
-                kappa_std = kappa.std().item()
-            else:
-                kappa_mean = kappa_std = 0.0
 
         if self.writer:
             self.writer.add_scalar('Loss/train', loss.item(), self.global_step)
@@ -911,9 +749,8 @@ class PCVRHeteroFormerTrainer:
             self.writer.add_scalar('Loss/recon', loss_recon.item(), self.global_step)
             self.writer.add_scalar('Loss/div', loss_div.item(), self.global_step)
             self.writer.add_scalar('Loss/empty', loss_empty.item(), self.global_step)
-            self.writer.add_scalar('Loss/spec', loss_spec.item(), self.global_step)
-            self.writer.add_scalar('Loss/align', loss_align.item(), self.global_step)
-            self.writer.add_scalar('Loss/mp', loss_mp.item(), self.global_step)
+            self.writer.add_scalar('Loss/packing', loss_packing.item(), self.global_step)
+            self.writer.add_scalar('Loss/kappa', loss_kappa.item(), self.global_step)  # patch2
 
             self.writer.add_scalar('Stream/logits_mean', logits_mean, self.global_step)
             self.writer.add_scalar('Stream/logits_std', logits_std, self.global_step)
@@ -926,8 +763,13 @@ class PCVRHeteroFormerTrainer:
             self.writer.add_scalar('Proto/dead_count', dead_count, self.global_step)
             self.writer.add_scalar('Proto/alive_count', alive_count, self.global_step)
             self.writer.add_scalar('Proto/col_uniformity', col_uniformity, self.global_step)
-            self.writer.add_scalar('Proto/kappa_mean', kappa_mean, self.global_step)
-            self.writer.add_scalar('Proto/kappa_std', kappa_std, self.global_step)
+            self.writer.add_scalar('Proto/kappa_mean', kappa_mean.item(), self.global_step)
+
+            # patch2: kappa_var 日志（从 kappa_loss 的计算图中提取）
+            if hasattr(self.model, 'prototype_vqs') and len(self.model.prototype_vqs) > 0:
+                first_vq = list(self.model.prototype_vqs.values())[0]
+                _, kappa = first_vq.get_prototypes()
+                self.writer.add_scalar('Proto/kappa_var', kappa.var().item(), self.global_step)
 
             for k in range(proto_weights.size(1)):
                 freq = (proto_weights.argmax(dim=-1) == k).float().mean().item()
@@ -938,6 +780,7 @@ class PCVRHeteroFormerTrainer:
             if self.adaptive_focal is not None:
                 self.writer.add_scalar('Focal/gamma', self.adaptive_focal.get_gamma().item(), self.global_step)
 
+            self.writer.add_scalar('Grad/emb_grad_norm', total_emb_grad_norm, self.global_step)
             if opt_diag:
                 self.writer.add_scalar('Grad/sparse', opt_diag.get('sparse_grad_norm', 0), self.global_step)
                 self.writer.add_scalar('Grad/dense', opt_diag.get('dense_grad_norm', 0), self.global_step)
@@ -950,7 +793,6 @@ class PCVRHeteroFormerTrainer:
                 if self.optimizer.proto_opt is not None:
                     self.writer.add_scalar('LR/proto', self.optimizer.proto_opt.param_groups[0]['lr'], self.global_step)
 
-            # v8.0: 课程学习进度
             if self.global_step < self.curriculum_warmup:
                 self.writer.add_scalar('Curriculum/alpha', self.global_step / self.curriculum_warmup, self.global_step)
                 for key, w in weights.items():
@@ -963,15 +805,14 @@ class PCVRHeteroFormerTrainer:
             log_parts.append(f"recon={loss_recon.item():.4f}")
             log_parts.append(f"div={loss_div.item():.4f}")
             log_parts.append(f"empty={loss_empty.item():.4f}")
-            log_parts.append(f"spec={loss_spec.item():.4f}")
-            log_parts.append(f"align={loss_align.item():.4f}")
-            log_parts.append(f"mp={loss_mp.item():.4f}")
+            log_parts.append(f"packing={loss_packing.item():.4f}")
+            log_parts.append(f"kappa={loss_kappa.item():.4f}")  # patch2
             log_parts.append(f"logits={logits_mean:.3f}±{logits_std:.3f}")
             log_parts.append(f"train_AUC={train_auc:.4f}")
             log_parts.append(f"pos_ema={self.pos_rate_ema:.4f}")
             log_parts.append(f"proto_usage={proto_usage:.3f}")
             log_parts.append(f"proto_entropy={proto_entropy:.3f}")
-            log_parts.append(f"kappa={kappa_mean:.2f}±{kappa_std:.2f}")
+            log_parts.append(f"kappa_mean={kappa_mean.item():.2f}")
             log_parts.append(f"col_uniformity={col_uniformity:.3f}")
             log_parts.append(f"dead_protos={dead_count}/{proto_weights.size(1)}")
             if self.adaptive_focal is not None:
@@ -1022,7 +863,7 @@ class PCVRHeteroFormerTrainer:
         return auc, logloss
 
     def train(self) -> None:
-        logging.info("Start training HeteroFormer v8.0 (Symplectic Multi-Scale)")
+        logging.info("Start training HeteroFormer v8.1-patch2 (Zero-Hessian Symplectic)")
         self.model.train()
         total_step = 0
 
@@ -1073,7 +914,7 @@ class PCVRHeteroFormerTrainer:
             dense_norm = sum(p.norm().item() for n, p in self.model.named_parameters()
                              if 'embedding' not in n and 'emb' not in n.lower())
             proto_norm = sum(p.norm().item() for n, p in self.model.named_parameters()
-                             if 'prototype' in n or 'proto_' in n or 'empty_prior' in n or 'match_vectors' in n or 'eta' in n)
+                             if 'prototype' in n or 'proto_' in n or 'empty_prior' in n or 'match_vectors' in n or 'eta' in n or 'kappa_log' in n)
             logging.info(
                 f"Epoch {epoch} | EmbNorm: {emb_norm:.1f} | DenseNorm: {dense_norm:.1f} | "
                 f"ProtoNorm: {proto_norm:.1f} | Ratio: {emb_norm/(dense_norm+1e-8):.1f}"

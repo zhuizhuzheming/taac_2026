@@ -74,10 +74,9 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --compile_mode default \
     --no-compile_dynamic \
     --num_codes 64 \
-    --sinkhorn_epsilon 0.1 \
-    --sinkhorn_iter 20 \
-    --min_mass_ratio 0.05 \
-    --curriculum_warmup 5000 \
     --sinkhorn_epsilon 0.05 \
-    --min_mass_ratio 0.016 \
+    --sinkhorn_iter 20 \
+    --min_mass_ratio 0.005 \
+    --curriculum_warmup 5000 \
+    --coherence_threshold 0.15 \
     "$@"
