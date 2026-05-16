@@ -433,82 +433,73 @@ class PCVRHeteroFormerTrainer:
         logits = logits.squeeze(-1)
 
         # ================================================================
-        # Phase 2: Probe（no_grad，无条件执行）
+        # Phase 2: 提前计算辅助任务 loss（用于 MetaAligner V2 加权）
         # ================================================================
-        with torch.no_grad():
-            u = getattr(self.model, '_cached_user_feat', None)
-            i = getattr(self.model, '_cached_item_feat', None)
-            p = getattr(self.model, '_cached_proto_repr', None)
+        loss_diff = torch.tensor(0.0, device=self.device)
+        loss_energy = torch.tensor(0.0, device=self.device)
 
-            if u is not None and i is not None and p is not None:
-                energy_out = self.model.energy_head(p, u, i)
-                probe_energy_loss = self._energy_margin_loss(energy_out, labels).item()
-                energy_flatness = energy_out.std().item()
+        if self.use_diffusion:
+            pred_noise, target_noise, t = self.model(model_input, task_id='diff')
+            loss_diff_raw = F.mse_loss(pred_noise, target_noise)
+            loss_diff = torch.clamp(loss_diff_raw, max=10.0)
 
-                diff_residual = uncertainty_pkg.get('diff_residual', 0.0)
-                if diff_residual == 0.0:
-                    _, diff_res = self.model.diff_head.get_gen_repr(
-                        p, u, i,
-                        getattr(self.model, '_cached_context_feat', p),
-                        deterministic=True,
-                    )
-                    diff_residual = diff_res.item() if torch.is_tensor(diff_res) else float(diff_res)
-
-                self.model.meta_aligner.record_probe(
-                    diff_loss=diff_residual,
-                    energy_loss=probe_energy_loss,
-                    logits_std=logits.std().item(),
-                    proto_entropy=assign_entropy.mean().item(),
-                    energy_flatness=energy_flatness,
-                    diff_residual=diff_residual,
-                )
+        if self.use_energy:
+            energy = self.model(model_input, task_id='energy')
+            loss_energy_raw = self._energy_margin_loss(energy, labels)
+            loss_energy = torch.clamp(loss_energy_raw, max=10.0)
 
         # ================================================================
-        # Phase 3: MetaAligner 决策
+        # Phase 3: MetaAligner V2 决策
         # ================================================================
-        valid_auc = self.valid_auc_history[-1] if self.valid_auc_history else 0.0
-        train_auc_latest = self.train_auc_history[-1] if self.train_auc_history else 0.0
+        valid_auc = self.valid_auc_history[-1] if self.valid_auc_history else None
+        train_auc_latest = self.train_auc_history[-1] if self.train_auc_history else None
 
-        meta_alpha = self.model.meta_aligner(
-            losses={'ctr': 0.0},
-            grad_norms=self.optimizer.get_grad_norms(),
+        # 计算当前 grad_norms（用于 MetaAligner）
+        grad_norms = self.optimizer.get_grad_norms()
+
+        meta = self.model.meta_aligner(
+            losses={'ctr': 0.0, 'diff': loss_diff.item(), 'energy': loss_energy.item()},
+            grad_norms=grad_norms,
             valid_auc=valid_auc,
             train_auc=train_auc_latest,
             global_step=self.global_step,
         )
 
+        # V2: 直接使用返回的权重
+        aux_weight = meta['aux_weight']
+        diff_weight = meta['diff_weight']
+        energy_weight = meta['energy_weight']
+        ctr_weight = meta['ctr_weight']
+
         # ================================================================
-        # Phase 4: CTR Backward
+        # Phase 4: 总 Loss 计算与 Backward
         # ================================================================
         if self.adaptive_focal is not None:
             loss_ctr = self.adaptive_focal(logits, labels)
         else:
             loss_ctr = F.binary_cross_entropy_with_logits(logits, labels)
 
-        loss_ctr = torch.where(
-            torch.isnan(loss_ctr) | torch.isinf(loss_ctr),
-            torch.tensor(0.0, device=loss_ctr.device),
-            loss_ctr
-        )
-
-        # 【新增】加入序列融合的熵正则 loss
+        # 序列融合熵正则（手术1）
         entropy_loss = getattr(self.model, '_cached_entropy_loss', torch.tensor(0.0, device=self.device))
         if torch.isnan(entropy_loss) or torch.isinf(entropy_loss):
             entropy_loss = torch.tensor(0.0, device=self.device)
-        
-        # 熵 loss 系数：小权重，不主导主任务
-        entropy_coef = 0.01
-        total_loss = loss_ctr + entropy_coef * entropy_loss
-        
+
+        # V2: 单一总 loss 加权
+        total_loss = (ctr_weight * loss_ctr + 
+                      diff_weight * loss_diff + 
+                      energy_weight * loss_energy + 
+                      0.01 * entropy_loss)
+
         # NaN 检查
         total_loss = torch.where(
             torch.isnan(total_loss) | torch.isinf(total_loss),
             torch.tensor(0.0, device=total_loss.device),
             total_loss
         )
-        
+
+        # 梯度检查与 backward
         self.optimizer.zero_grad_shared()
-        total_loss.backward(retain_graph=True)  # 注意：这里改 total_loss
+        total_loss.backward(retain_graph=True)
 
         ctr_grad_norm = 0.0
         has_nan_grad = False
@@ -530,32 +521,8 @@ class PCVRHeteroFormerTrainer:
             grad_norm_ctr = self.optimizer.grad_norm_history['ctr'][-1] if self.optimizer.grad_norm_history['ctr'] else 0.0
 
         # ================================================================
-        # Phase 5: 辅助任务 Backward（条件执行）
+        # Phase 5: Geometry 始终激活（packing loss）
         # ================================================================
-        loss_diff = torch.tensor(0.0, device=self.device)
-        loss_energy = torch.tensor(0.0, device=self.device)
-
-        if self.use_diffusion and meta_alpha.get('diff', 0.0) > 0.001:
-            pred_noise, target_noise, t = self.model(model_input, task_id='diff')
-            loss_diff_raw = F.mse_loss(pred_noise, target_noise)
-            loss_diff = torch.clamp(loss_diff_raw, max=10.0) * meta_alpha['diff']
-            if not (torch.isnan(loss_diff) or torch.isinf(loss_diff)):
-                self.optimizer.zero_grad_diff()
-                loss_diff.backward()
-                self.optimizer.record_grad_norm('diff', self.model)
-                self.optimizer.step_diff()
-
-        if self.use_energy and meta_alpha.get('energy', 0.0) > 0.001:
-            energy = self.model(model_input, task_id='energy')
-            loss_energy_raw = self._energy_margin_loss(energy, labels)
-            loss_energy = torch.clamp(loss_energy_raw, max=10.0) * meta_alpha['energy']
-            if not (torch.isnan(loss_energy) or torch.isinf(loss_energy)):
-                self.optimizer.zero_grad_energy()
-                loss_energy.backward()
-                self.optimizer.record_grad_norm('energy', self.model)
-                self.optimizer.step_energy()
-
-        # Geometry 始终激活
         loss_packing = self.model.get_packing_loss()
         loss_packing = torch.clamp(loss_packing, max=10.0)
         if not (torch.isnan(loss_packing) or torch.isinf(loss_packing)):
@@ -572,11 +539,7 @@ class PCVRHeteroFormerTrainer:
 
         self.global_step += 1
 
-        if len(self.model.meta_aligner.loss_history) > 0:
-            self.model.meta_aligner.loss_history[-1]['ctr'] = loss_ctr.item()
-            self.model.meta_aligner.loss_history[-1]['diff'] = loss_diff.item()
-            self.model.meta_aligner.loss_history[-1]['energy'] = loss_energy.item()
-
+        # 计算 train_auc
         with torch.no_grad():
             logits_mean = logits.mean().item()
             logits_std = logits.std().item()
@@ -595,56 +558,66 @@ class PCVRHeteroFormerTrainer:
             self.writer.add_scalar('Loss/diff', loss_diff.item(), self.global_step)
             self.writer.add_scalar('Loss/energy', loss_energy.item(), self.global_step)
             self.writer.add_scalar('Loss/packing', loss_packing.item(), self.global_step)
+            self.writer.add_scalar('Loss/total', total_loss.item(), self.global_step)
             self.writer.add_scalar('Stream/logits_mean', logits_mean, self.global_step)
             self.writer.add_scalar('Stream/logits_std', logits_std, self.global_step)
             self.writer.add_scalar('Diagnostics/train_auc', train_auc, self.global_step)
-            self.writer.add_scalar('Proto/kappa_mean', kappa_mean.item(), self.global_step)
-            self.writer.add_scalar('Proto/assign_entropy', assign_entropy.mean().item(), self.global_step)
             self.writer.add_scalar('Diagnostics/grad_norm_ctr', grad_norm_ctr, self.global_step)
             self.writer.add_scalar('Diagnostics/nan_recovery_count', self.optimizer.nan_recovery_count, self.global_step)
+            self.writer.add_scalar('Proto/kappa_mean', kappa_mean.item(), self.global_step)
+            self.writer.add_scalar('Proto/assign_entropy', assign_entropy.mean().item(), self.global_step)
 
-            # MetaAligner 专属监控
-            mode_map = {'warmup': 0, 'probe_burn_in': 1, 'train_schedule': 2, 'hybrid': 3, 'valid_pid': 4, 'unknown': -1}
-            self.writer.add_scalar('Meta/mode', mode_map.get(meta_alpha.get('mode', 'unknown'), -1), self.global_step)
-            self.writer.add_scalar('Meta/health', meta_alpha.get('health', 0.0), self.global_step)
-            self.writer.add_scalar('Meta/aux_weight', meta_alpha.get('aux_weight', 0.0), self.global_step)
-            self.writer.add_scalar('Meta/alpha_ctr', meta_alpha.get('ctr', 1.0), self.global_step)
-            self.writer.add_scalar('Meta/alpha_diff', meta_alpha.get('diff', 0.0), self.global_step)
-            self.writer.add_scalar('Meta/alpha_energy', meta_alpha.get('energy', 0.0), self.global_step)
-            
-            self.writer.add_scalar('SeqFusion/entropy_loss', entropy_loss.item(), self.global_step)
-            self.writer.add_scalar('SeqFusion/entropy_coef_weighted', (entropy_coef * entropy_loss).item(), self.global_step)
+            # MetaAligner V2 监控
+            mode_map = {'warmup': 0, 'probe_burn_in': 1, 'train_schedule': 2, 
+                       'hybrid': 3, 'valid_pid': 4, 'interpolated': 5, 'unknown': -1}
+            self.writer.add_scalar('Meta/mode', mode_map.get(meta.get('mode', 'unknown'), -1), self.global_step)
+            self.writer.add_scalar('Meta/gap', meta.get('gap', 0.0), self.global_step)
+            self.writer.add_scalar('Meta/aux_weight', meta.get('aux_weight', 0.0), self.global_step)
+            self.writer.add_scalar('Meta/ctr_weight', meta.get('ctr_weight', 1.0), self.global_step)
+            self.writer.add_scalar('Meta/diff_weight', meta.get('diff_weight', 0.0), self.global_step)
+            self.writer.add_scalar('Meta/energy_weight', meta.get('energy_weight', 0.0), self.global_step)
+            self.writer.add_scalar('Meta/ema_aux', meta.get('ema_aux', 0.0), self.global_step)
+            self.writer.add_scalar('Meta/steps_since_valid', meta.get('steps_since_valid', 0), self.global_step)
 
+            # 手术1: 序列融合门控监控
+            if hasattr(self.model, '_cached_seq_gate_short') and self.model._cached_seq_gate_short is not None:
+                gate_short = self.model._cached_seq_gate_short
+                for i, domain in enumerate(self.model.seq_domains):
+                    if i < gate_short.size(1):
+                        self.writer.add_scalar(f'SeqFusion/short_{domain}', 
+                                              gate_short[:, i].mean().item(), self.global_step)
+
+            # 手术2: 显式交叉监控（如果有）
+            if hasattr(self.model, 'explicit_cross') and self.model.explicit_cross is not None:
+                cross_norm = self.model.explicit_cross.cross_weights.norm().item()
+                self.writer.add_scalar('CrossLayer/weight_norm', cross_norm, self.global_step)
+
+            # Gen 门控监控
             if gen_gates is not None:
                 self.writer.add_scalar('Gen/gate_proto', gen_gates[:, 0].mean().item(), self.global_step)
                 self.writer.add_scalar('Gen/gate_diff', gen_gates[:, 1].mean().item(), self.global_step)
                 self.writer.add_scalar('Gen/gate_energy', gen_gates[:, 2].mean().item(), self.global_step)
 
-        # 在原有 logging 之前添加
-        if hasattr(self.model, '_cached_seq_gate_short') and self.model._cached_seq_gate_short is not None:
-            gate_short = self.model._cached_seq_gate_short
-            for i, domain in enumerate(self.model.seq_domains):
-                if i < gate_short.size(1):
-                    self.writer.add_scalar(f'SeqFusion/short_{domain}', gate_short[:, i].mean().item(), self.global_step)
-
         # Console log
         if self.global_step % 100 == 0:
             log_parts = [
                 f"[Step {self.global_step}]",
-                f"mode={meta_alpha.get('mode', '?')}",
+                f"mode={meta.get('mode', '?')}",
                 f"ctr={loss_ctr.item():.4f}",
                 f"diff={loss_diff.item():.4f}",
                 f"energy={loss_energy.item():.4f}",
                 f"pack={loss_packing.item():.4f}",
+                f"total={total_loss.item():.4f}",
                 f"logits={logits_mean:.3f}±{logits_std:.3f}",
                 f"trAUC={train_auc:.4f}",
                 f"k={kappa_mean.item():.2f}",
                 f"ent={assign_entropy.mean().item():.2f}",
                 f"grad={grad_norm_ctr:.2f}",
                 f"nanR={self.optimizer.nan_recovery_count}",
-                f"meta=[{meta_alpha.get('ctr', 1.0):.2f},{meta_alpha.get('diff', 0.0):.2f},{meta_alpha.get('energy', 0.0):.2f}]",
-                f"health={meta_alpha.get('health', 0.0):.2f}",
-                f"integ=[{meta_alpha.get('integral_valid_pid', 0.0):.2f},{meta_alpha.get('integral_hybrid', 0.0):.2f},{meta_alpha.get('integral_train', 0.0):.2f}]",
+                f"meta=[{meta.get('ctr_weight', 1.0):.2f},{meta.get('diff_weight', 0.0):.2f},{meta.get('energy_weight', 0.0):.2f}]",
+                f"aux_w={meta.get('aux_weight', 0.0):.3f}",
+                f"gap={meta.get('gap', 0.0):.3f}",
+                f"ema={meta.get('ema_aux', 0.0):.3f}",
             ]
             if gen_gates is not None:
                 log_parts.append(
@@ -657,9 +630,10 @@ class PCVRHeteroFormerTrainer:
             'loss_diff': loss_diff.item(),
             'loss_energy': loss_energy.item(),
             'loss_packing': loss_packing.item(),
+            'total_loss': total_loss.item(),
             'train_auc': train_auc,
-            'meta_mode': meta_alpha.get('mode', 'unknown'),
-            'meta_health': meta_alpha.get('health', 0.0),
+            'meta_mode': meta.get('mode', 'unknown'),
+            'meta_aux_weight': meta.get('aux_weight', 0.0),
         }
 
     def evaluate(self, epoch: Optional[int] = None) -> Tuple[float, float]:

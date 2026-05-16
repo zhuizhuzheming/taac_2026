@@ -266,6 +266,51 @@ class SSMCell(nn.Module):
 
         return y
 
+class BilinearCrossLayer(nn.Module):
+    """
+    轻量级双线性交叉层：捕获域间二阶交互
+    只保留上三角交互，避免参数量爆炸
+    """
+    def __init__(self, d_model: int, num_fields: int = 4, cross_ratio: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.num_fields = num_fields
+        self.cross_ratio = cross_ratio  # 交叉项残差比例，避免主导
+        
+        # 上三角交互参数：[i, j, d] for i < j
+        num_pairs = num_fields * (num_fields - 1) // 2
+        self.cross_weights = nn.Parameter(torch.randn(num_pairs, d_model) * 0.01)
+        
+        # 输出投影（稳定训练）
+        self.output_norm = nn.LayerNorm(d_model)
+        
+    def forward(self, fields: List[Tensor]) -> List[Tensor]:
+        """
+        Args:
+            fields: List[Tensor]，每个 [B, D]，如 [user_feat, item_feat, context_feat, seq_feat]
+        Returns:
+            交叉增强后的场表示，残差形式
+        """
+        num_actual = len(fields)
+        if num_actual < 2:
+            return fields
+        
+        out = [f.clone() for f in fields]
+        pair_idx = 0
+        
+        for i in range(num_actual):
+            for j in range(i + 1, num_actual):
+                # 逐元素交互：[B, D] * [D] * [B, D] -> [B, D]
+                interaction = fields[i] * self.cross_weights[pair_idx] * fields[j]
+                
+                # 残差叠加，避免主导原始表示
+                out[i] = out[i] + self.cross_ratio * interaction
+                out[j] = out[j] + self.cross_ratio * interaction
+                pair_idx += 1
+        
+        # 归一化稳定
+        out = [self.output_norm(o) for o in out]
+        return out
 
 # ==============================================================================
 # v9.1: ContinuousSequenceEncoder (preserved)
@@ -897,9 +942,13 @@ class FokkerPlanckRegularizer(nn.Module):
 
 class MetaAligner(nn.Module):
     """
-    MetaAligner v9.3-RSOU
-    双模式：Train-only Schedule + Valid-aware PID
-    Online Uncertainty 驱动，零 valid_auc 时自主调度
+    MetaAligner v2: 协同自适应正则化控制器
+    核心改进：
+    1. 单一 aux_weight 信源，无 alpha/diff/energy 分离
+    2. 泄漏积分器：历史自动衰减，无债务累积
+    3. Valid 间插值：无 valid 时向保守值回归，而非 health 放飞
+    4. 自适应 EMA：根据 gap 变化率调整平滑度
+    5. 辅助任务只输出 loss 权重，不输出表示（物理隔离）
     """
 
     def __init__(
@@ -907,166 +956,74 @@ class MetaAligner(nn.Module):
         num_codes: int = 128,
         warmup_steps: int = 300,
         probe_burn_in: int = 200,
-        history_len: int = 50,
         kp: float = 2.0,
-        ki: float = 0.1,
+        ki: float = 0.05,      # 降低，配合泄漏积分器
         kd: float = 1.0,
-        w_plateau: float = 0.25,
-        w_grad_fatigue: float = 0.20,
-        w_confidence: float = 0.20,
-        w_proto_chaos: float = 0.20,
-        w_diff_residual: float = 0.15,
-        plateau_window: int = 30,
-        plateau_threshold: float = 0.005,
-        grad_fatigue_ratio: float = 0.7,
-        target_logits_std: float = 0.25,
-        target_entropy_ratio: float = 0.6,
-        max_aux_weight: float = 0.5,
-        ema_decay: float = 0.95,
+        max_aux_weight: float = 0.3,   # 从 0.5 降到 0.3
+        leak_rate: float = 0.01,       # 积分器泄漏率
+        valid_decay_rate: float = 0.995,  # Valid 间 aux_weight 衰减
+        ema_fast: float = 0.8,         # gap 变化快时用
+        ema_slow: float = 0.95,        # gap 稳定时用
     ):
         super().__init__()
-        self.dummy = nn.Parameter(torch.zeros(1))
+        self.dummy = nn.Parameter(torch.zeros(1))  # 保持 nn.Module 身份
+        
         self.warmup_steps = warmup_steps
         self.probe_burn_in = probe_burn_in
         self.max_aux_weight = max_aux_weight
+        self.leak_rate = leak_rate
+        self.valid_decay_rate = valid_decay_rate
+        self.ema_fast = ema_fast
+        self.ema_slow = ema_slow
+        
         self.kp, self.ki, self.kd = kp, ki, kd
-        self.integral_gap = 0.0
+        
+        # 泄漏积分器：带自动衰减
+        self.register_buffer('integral', torch.tensor(0.0))
+        self.register_buffer('integral_momentum', torch.tensor(0.0))  # 二阶矩，检测变化
+        
+        # Valid 间状态缓存
+        self.register_buffer('last_valid_gap', torch.tensor(0.0))
+        self.register_buffer('last_valid_aux', torch.tensor(0.0))
+        self.register_buffer('steps_since_valid', torch.tensor(0))
+        
+        # EMA 状态
+        self.register_buffer('ema_aux', torch.tensor(0.0))
+        self.register_buffer('ema_gap', torch.tensor(0.0))
+        
+        # 历史（仅用于诊断，不参与计算）
+        self.gap_history = deque(maxlen=10)
+        self.aux_history = deque(maxlen=10)
 
-        self.train_auc_history = deque(maxlen=history_len)
-        self.loss_history = deque(maxlen=history_len)
-        self.grad_history = deque(maxlen=history_len)
-        self.auc_history = deque(maxlen=history_len)
+    def _leaky_integrate(self, gap: float) -> float:
+        """
+        泄漏积分：每一步自动衰减，防止历史债务
+        integral_t = (1 - leak) * integral_{t-1} + gap_t
+        """
+        self.integral = (1 - self.leak_rate) * self.integral + gap
+        # 软裁剪，非硬边界
+        self.integral = self.integral * torch.sigmoid(self.integral)  # 自限幅
+        return self.integral.item()
 
-        # Probe 历史（来自 no_grad 前向）
-        self.probe_diff_loss = deque(maxlen=history_len)
-        self.probe_energy_loss = deque(maxlen=history_len)
-        self.probe_logits_std = deque(maxlen=history_len)
-        self.probe_proto_entropy = deque(maxlen=history_len)
-        self.probe_energy_flatness = deque(maxlen=history_len)
-        self.probe_diff_residual = deque(maxlen=history_len)
+    def _adaptive_ema(self, new_val: float, old_ema: float) -> float:
+        """
+        自适应 EMA：根据变化速度选择快/慢衰减
+        """
+        delta = abs(new_val - old_ema)
+        # 变化大时用 fast（快速响应），变化小时用 slow（稳定）
+        ema_decay = self.ema_fast if delta > 0.1 else self.ema_slow
+        return ema_decay * old_ema + (1 - ema_decay) * new_val
 
-        self.ema_decay = ema_decay
-        self.ema_alpha = {'ctr': 1.0, 'diff': 0.0, 'energy': 0.0}
-
-        self.uncertainty_cfg = {
-            'w_plateau': w_plateau,
-            'w_grad_fatigue': w_grad_fatigue,
-            'w_confidence': w_confidence,
-            'w_proto_chaos': w_proto_chaos,
-            'w_diff_residual': w_diff_residual,
-            'plateau_window': plateau_window,
-            'plateau_threshold': plateau_threshold,
-            'grad_fatigue_ratio': grad_fatigue_ratio,
-            'target_logits_std': target_logits_std,
-            'target_entropy_ratio': target_entropy_ratio,
-            'num_codes': num_codes,
-        }
-
-    def record_probe(
-        self,
-        diff_loss: float,
-        energy_loss: float,
-        logits_std: float,
-        proto_entropy: float,
-        energy_flatness: float,
-        diff_residual: float,
-    ):
-        self.probe_diff_loss.append(float(diff_loss))
-        self.probe_energy_loss.append(float(energy_loss))
-        self.probe_logits_std.append(float(logits_std))
-        self.probe_proto_entropy.append(float(proto_entropy))
-        self.probe_energy_flatness.append(float(energy_flatness))
-        self.probe_diff_residual.append(float(diff_residual))
-
-    def _compute_training_health(self, grad_norms: Dict[str, float]) -> float:
-        cfg = self.uncertainty_cfg
-        scores = []
-
-        # 1. Plateau 检测
-        plateau_score = 0.0
-        if len(self.train_auc_history) >= cfg['plateau_window']:
-            recent = list(self.train_auc_history)[-cfg['plateau_window']:]
-            range_val = max(recent) - min(recent)
-            plateau_score = max(0.0, 1.0 - range_val / cfg['plateau_threshold'])
-        scores.append(cfg['w_plateau'] * min(1.0, plateau_score))
-
-        # 2. Grad Fatigue
-        grad_fatigue = 0.0
-        if 'ctr' in grad_norms and len(self.grad_history) >= 20:
-            early_vals = [self.grad_history[i].get('ctr', 0.0) for i in range(min(10, len(self.grad_history)))]
-            early_vals = [v for v in early_vals if v > 0]
-            early = np.mean(early_vals) if early_vals else 0.0
-            recent = grad_norms['ctr']
-            if early > 0:
-                ratio = recent / early
-                grad_fatigue = max(0.0, min(1.0, (1.0 - ratio) / cfg['grad_fatigue_ratio']))
-        scores.append(cfg['w_grad_fatigue'] * grad_fatigue)
-
-        # 3. Confidence Deficit
-        conf_deficit = 0.0
-        if self.probe_logits_std:
-            recent_std = np.mean(list(self.probe_logits_std)[-20:])
-            conf_deficit = max(0.0, 1.0 - recent_std / cfg['target_logits_std'])
-        scores.append(cfg['w_confidence'] * conf_deficit)
-
-        # 4. Proto Chaos
-        proto_chaos = 0.0
-        if self.probe_proto_entropy:
-            recent_ent = np.mean(list(self.probe_proto_entropy)[-20:])
-            max_ent = math.log(cfg['num_codes'])
-            target_ent = max_ent * cfg['target_entropy_ratio']
-            if target_ent > 0:
-                proto_chaos = min(1.0, recent_ent / target_ent)
-        scores.append(cfg['w_proto_chaos'] * proto_chaos)
-
-        # 5. Diff Residual
-        diff_res = 0.0
-        if self.probe_diff_residual:
-            recent_res = np.mean(list(self.probe_diff_residual)[-20:])
-            diff_res = min(1.0, recent_res / 1.0)
-        scores.append(cfg['w_diff_residual'] * diff_res)
-
-        return min(1.0, sum(scores))
-
-    def _pid_control(self, signals: Dict[str, float]) -> float:
-        gap = signals['gap']
-        gap_trend = signals.get('gap_trend', 0.0)
-        P = self.kp * gap
-        self.integral_gap = max(-5.0, min(5.0, self.integral_gap + gap))
-        I = self.ki * self.integral_gap
-        D = self.kd * (-gap_trend)
-        return max(0.0, min(self.max_aux_weight, P + I + D))
-
-    def _allocate(self, aux_weight: float, use_probe: bool = True) -> Dict[str, float]:
-        if aux_weight <= 0.001:
-            return {'diff': 0.0, 'energy': 0.0}
-
-        diff_score = 0.6
-        energy_score = 0.4
-
-        if use_probe and len(self.probe_diff_loss) >= 5:
-            diff_recent = np.mean(list(self.probe_diff_loss)[-5:])
-            diff_old = np.mean(list(self.probe_diff_loss)[:5]) if len(self.probe_diff_loss) >= 10 else diff_recent
-            if diff_old > diff_recent:
-                diff_score *= 1.3
-            elif diff_old < diff_recent:
-                diff_score *= 0.7
-
-        if use_probe and len(self.probe_energy_loss) >= 5:
-            energy_recent = np.mean(list(self.probe_energy_loss)[-5:])
-            energy_old = np.mean(list(self.probe_energy_loss)[:5]) if len(self.probe_energy_loss) >= 10 else energy_recent
-            if energy_old > energy_recent:
-                energy_score *= 1.3
-            elif energy_old < energy_recent:
-                energy_score *= 0.7
-
-        total = diff_score + energy_score
-        if total < 1e-6:
-            return {'diff': aux_weight * 0.6, 'energy': aux_weight * 0.4}
-        return {
-            'diff': aux_weight * (diff_score / total),
-            'energy': aux_weight * (energy_score / total),
-        }
+    def _interpolate_without_valid(self, base_aux: float) -> float:
+        """
+        Valid 间插值：向保守值回归，而非 health 放飞
+        """
+        steps = int(self.steps_since_valid.item())
+        # 无 valid 越久，aux_weight 越向 0 衰减（保守策略）
+        decay = self.valid_decay_rate ** steps
+        # 基础值与保守值的插值
+        conservative = 0.05  # 最低辅助权重
+        return conservative + (base_aux - conservative) * decay
 
     def forward(
         self,
@@ -1076,73 +1033,63 @@ class MetaAligner(nn.Module):
         train_auc: Optional[float] = None,
         global_step: int = 0,
     ) -> Dict[str, Any]:
-        if train_auc is not None:
-            self.train_auc_history.append(float(train_auc))
-        if valid_auc is not None and valid_auc > 0:
-            self.auc_history.append((float(valid_auc), float(train_auc or 0.0)))
-        self.grad_history.append({k: float(v) for k, v in grad_norms.items()})
-        self.loss_history.append({k: float(v) for k, v in losses.items()})
-
-        mode = 'unknown'
-        alpha = {'ctr': 1.0, 'diff': 0.0, 'energy': 0.0}
-        health = 0.0
-        aux_weight = 0.0
-
-        # 动态缩短 warmup：若提前 plateau
-        effective_warmup = self.warmup_steps
-        if global_step < self.warmup_steps and len(self.train_auc_history) >= 30:
-            recent = list(self.train_auc_history)[-30:]
-            if max(recent) > 0.75 and (max(recent) - min(recent)) < 0.01:
-                effective_warmup = global_step
-
-        if global_step < effective_warmup:
-            mode = 'warmup'
-        elif global_step < effective_warmup + self.probe_burn_in:
-            mode = 'probe_burn_in'
+        
+        # === Phase 1: 计算当前 gap ===
+        gap = 0.0
+        if train_auc is not None and valid_auc is not None and valid_auc > 0:
+            gap = max(0.0, train_auc - valid_auc)
+            self.gap_history.append(gap)
+            self.last_valid_gap = torch.tensor(gap)
+            self.steps_since_valid = torch.tensor(0)
         else:
-            has_valid = valid_auc is not None and valid_auc > 0
-            has_history = len(self.auc_history) >= 2
-
-            if has_valid and has_history:
-                mode = 'valid_pid'
-                v0 = self.auc_history[0][0]
-                v1 = self.auc_history[-1][0]
-                gap_trend = (v1 - v0) / len(self.auc_history)
-                gap = max(0.0, float(train_auc or 0.0) - float(valid_auc))
-                aux_weight = self._pid_control({'gap': gap, 'gap_trend': gap_trend})
-
-            elif has_valid and not has_history:
-                mode = 'hybrid'
-                health = self._compute_training_health(grad_norms)
-                train_weight = health * self.max_aux_weight * 0.7
-                gap = max(0.0, float(train_auc or 0.0) - float(valid_auc))
-                pid_weight = self._pid_control({'gap': gap, 'gap_trend': 0.0}) * 0.3
-                aux_weight = min(self.max_aux_weight, train_weight + pid_weight)
-
-            else:
-                mode = 'train_schedule'
-                health = self._compute_training_health(grad_norms)
-                aux_weight = health * self.max_aux_weight
-
-            alloc = self._allocate(aux_weight, use_probe=True)
-            alpha['ctr'] = max(0.5, 1.0 - aux_weight)
-            alpha['diff'] = alloc['diff']
-            alpha['energy'] = alloc['energy']
-
-        # EMA 平滑 + 硬约束
-        for task in alpha:
-            self.ema_alpha[task] = (
-                self.ema_decay * self.ema_alpha[task] + (1.0 - self.ema_decay) * alpha[task]
-            )
-        self.ema_alpha['ctr'] = max(0.5, min(1.0, self.ema_alpha['ctr']))
-        self.ema_alpha['diff'] = max(0.0, min(0.4, self.ema_alpha['diff']))
-        self.ema_alpha['energy'] = max(0.0, min(0.3, self.ema_alpha['energy']))
-
-        total = sum(self.ema_alpha.values())
-        result = {k: v / total for k, v in self.ema_alpha.items()}
-        result['mode'] = mode
-        result['health'] = health
-        result['aux_weight'] = aux_weight
+            self.steps_since_valid += 1
+            # 无 valid 时，用上次 valid 的 gap 估计（保守假设 gap 不变或微增）
+            gap = float(self.last_valid_gap.item()) * 1.01  # 微增假设
+        
+        # === Phase 2: PID 控制（泄漏积分器） ===
+        integral = self._leaky_integrate(gap)
+        
+        # 变化率（导数）
+        gap_trend = 0.0
+        if len(self.gap_history) >= 2:
+            gap_trend = (self.gap_history[-1] - self.gap_history[0]) / len(self.gap_history)
+        
+        P = self.kp * gap
+        I = self.ki * integral
+        D = self.kd * (-gap_trend)
+        
+        raw_aux = max(0.0, P + I + D)
+        
+        # === Phase 3: Valid 间插值 ===
+        if valid_auc is None or valid_auc <= 0:
+            raw_aux = self._interpolate_without_valid(raw_aux)
+        
+        # === Phase 4: 自适应 EMA 平滑 ===
+        new_ema = self._adaptive_ema(raw_aux, float(self.ema_aux.item()))
+        self.ema_aux = torch.tensor(new_ema)
+        
+        # 最终 aux_weight：EMA 后硬上限
+        aux_weight = min(self.max_aux_weight, new_ema)
+        
+        # === Phase 5: 辅助任务分配（单一信源） ===
+        # 不再维护独立的 alpha['diff'] / alpha['energy']
+        # 直接返回 aux_weight，由调用方按比例分配
+        diff_ratio = 0.6  # 固定比例，或基于 probe 动态调整
+        energy_ratio = 0.4
+        
+        result = {
+            'aux_weight': aux_weight,
+            'diff_weight': aux_weight * diff_ratio,
+            'energy_weight': aux_weight * energy_ratio,
+            'ctr_weight': 1.0 - aux_weight,
+            'gap': gap,
+            'integral': integral,
+            'mode': 'valid_pid' if (valid_auc and valid_auc > 0) else 'interpolated',
+            'ema_aux': new_ema,
+            'steps_since_valid': int(self.steps_since_valid.item()),
+        }
+        
+        self.aux_history.append(aux_weight)
         return result
 
 
@@ -1242,6 +1189,7 @@ class PCVRHeteroFormer(nn.Module):
             lie_rank=lie_rank,
         )
 
+        self.explicit_cross = BilinearCrossLayer(d_model, num_fields=4, cross_ratio=0.1)
         self.cross_field = CrossFieldNet(
             fields=['user', 'item', 'context', 'seq'],
             d_model=d_model, num_layers=num_layers,
@@ -1266,22 +1214,14 @@ class PCVRHeteroFormer(nn.Module):
             num_codes=num_codes,
             warmup_steps=300,
             probe_burn_in=200,
-            history_len=50,
             kp=2.0,
-            ki=0.1,
+            ki=0.05,              # V2 降低
             kd=1.0,
-            w_plateau=0.25,
-            w_grad_fatigue=0.20,
-            w_confidence=0.20,
-            w_proto_chaos=0.20,
-            w_diff_residual=0.15,
-            plateau_window=30,
-            plateau_threshold=0.005,
-            grad_fatigue_ratio=0.7,
-            target_logits_std=0.25,
-            target_entropy_ratio=0.6,
-            max_aux_weight=0.5,
-            ema_decay=0.95,
+            max_aux_weight=0.3,     # V2 从 0.5 降到 0.3
+            leak_rate=0.01,        # V2 新增
+            valid_decay_rate=0.995,  # V2 新增
+            ema_fast=0.8,          # V2 新增
+            ema_slow=0.95,         # V2 新增
         )
         self.logit_temperature = nn.Parameter(torch.tensor(0.0))
         self.logit_bias = nn.Parameter(torch.tensor(0.0))
@@ -1489,6 +1429,11 @@ class PCVRHeteroFormer(nn.Module):
             s_short, seq_meta, user_feat, task_id=task_id, is_training=self.training
         )
 
+        # 3. 【手术2】显式二阶交叉
+        fields_list = [user_feat, item_feat, context_feat, s_short]
+        crossed_fields = self.explicit_cross(fields_list)
+        user_feat, item_feat, context_feat, s_short = crossed_fields
+
         # 4. Cross-field
         fields = {'user': user_feat, 'item': item_feat, 'context': context_feat, 'seq': s_short}
         cross_out = self.cross_field(fields, seq_cond=s_short)
@@ -1509,12 +1454,18 @@ class PCVRHeteroFormer(nn.Module):
 
             # 【v9.3-RS】始终启用 fusion，eval 时 deterministic
             if self.use_generative_fusion:
+                # 【修复3】完全 detach，切断辅助任务梯度流向共享层
                 gen_diff_repr, diff_residual = self.diff_head.get_gen_repr(
-                    proto_repr, user_feat, item_feat, context_feat,
+                    proto_repr.detach(), 
+                    user_feat.detach(), 
+                    item_feat.detach(), 
+                    context_feat.detach(),
                     deterministic=not self.training,
                 )
                 gen_energy_repr = self.energy_head.get_gen_repr(
-                    proto_repr, user_feat, item_feat
+                    proto_repr.detach(), 
+                    user_feat.detach(), 
+                    item_feat.detach(),
                 )
 
                 # 计算 uncertainty 信号（no_grad，轻量）
