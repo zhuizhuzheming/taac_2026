@@ -30,7 +30,7 @@ train_args=(
     --batch_size 256
     --lr 1e-4
     --sparse_lr 0.001
-    --warmup_steps 300          # 【建议】与 MetaAligner 内部 warmup 对齐
+    --warmup_steps 300          # 与 MetaAligner 内部 warmup 对齐
     --num_epochs 999
     --patience 5
     --buffer_batches 50
@@ -41,7 +41,7 @@ train_args=(
     --loss_type focal
     --focal_alpha 0.1
     --focal_gamma 2.0
-    --stochastic_depth_prob 0.0
+    --stochastic_depth_prob 0.1
     --seq_max_lens "seq_a:256,seq_b:256,seq_c:512,seq_d:512"
     --label_smoothing_strategy hybrid
     --label_smoothing_max_eps 0.05
@@ -65,19 +65,36 @@ train_args=(
     --min_mass_ratio 0.005
     --coherence_threshold 0.15
     --lie_rank 8
-    --use_diffusion
-    --use_energy
-    --energy_margin 1.0
-    --energy_weight 0.1
-    --diff_weight 0.05
+    --dropout_rate 0.2          # 全局dropout
+    --id_dropout_rate 0.05       # 特征ID随机丢弃
+    --seq_id_dropout_rate 0.05   # 序列ID随机丢弃
 
-    # v9.3 关键参数
+    # v10 关键参数
     --kappa_base 2.0
     --sinkhorn_epsilon 0.05
     --packing_weight 0.1
 
-    # 【新增】建议增加验证频率，让 Valid-aware PID 有机会触发
-    --eval_every_n_steps 1800   # 约 1 个 epoch 验证一次（与你的 1800 步/epoch 对齐）
+    # 【v10 新增】生成式语义层自监督权重
+    --ib_weight 0.01             # 信息瓶颈约束
+    --recon_weight 0.05          # 重建质量
+    --ortho_weight 0.01          # 正交约束
+
+    # 【v10 保留】Energy 校准器参数
+    --energy_margin 1.0
+    --energy_weight 0.1
+
+    # 【v10 移除】以下参数已废弃，由架构内部自动管理
+    # --use_diffusion              # 已移除：DiffusionExplainer 内联
+    # --use_energy                 # 已移除：EnergyCalibrator 内联
+    # --use_domain_adversarial     # 已移除：v10 不再使用
+    # --diff_weight 0.05           # 已移除：由 recon_weight 替代
+    # --energy_weight 0.1          # 已保留：energy ranking loss 权重
+    # --meta_update_interval 100   # 已移除：MetaAligner 简化
+    # --curriculum_warmup 5000     # 已移除：v10 不再使用
+    # --diffusion_warmup 1000      # 已移除：v10 不再使用
+
+    # 验证频率
+    --eval_every_n_steps 600
 
     "$@"
 )

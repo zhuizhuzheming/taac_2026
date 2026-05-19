@@ -800,19 +800,19 @@ def get_pcvr_data(
     seq_max_lens: Optional[Dict[str, int]] = None,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
-    """【v9.2-anti-leak】防泄露数据加载器（兼容原有接口）"""
+    """【v10-anti-leak】防泄露数据加载器（兼容原有接口）"""
     random.seed(seed)
     np.random.seed(seed)
 
     anti_leak_mode = os.environ.get('ANTI_LEAK_MODE', 'timestamp').lower()
     if anti_leak_mode not in ['timestamp', 'user_id', 'none']:
-        logging.warning(f"【v9.2-anti-leak】Unknown ANTI_LEAK_MODE={anti_leak_mode}, using 'timestamp'")
+        logging.warning(f"【v10-anti-leak】Unknown ANTI_LEAK_MODE={anti_leak_mode}, using 'timestamp'")
         anti_leak_mode = 'timestamp'
 
     if anti_leak_mode == 'none':
-        logging.info("【v9.2-anti-leak】Anti-leak mode DISABLED")
+        logging.info("【v10-anti-leak】Anti-leak mode DISABLED")
     else:
-        logging.info(f"【v9.2-anti-leak】Anti-leak mode ENABLED: {anti_leak_mode}")
+        logging.info(f"【v10-anti-leak】Anti-leak mode ENABLED: {anti_leak_mode}")
 
     import glob as _glob
     pq_files = sorted(_glob.glob(os.path.join(data_dir, '*.parquet')))
@@ -858,10 +858,10 @@ def get_pcvr_data(
         train_rgs = rg_info[:n_train_rgs]
         valid_rgs = rg_info[n_train_rgs:]
         split_timestamp = None
-        logging.info(f"【v9.2-anti-leak】Original split: {n_train_rgs} train RGs, {n_valid_rgs} valid RGs")
+        logging.info(f"【v110-anti-leak】Original split: {n_train_rgs} train RGs, {n_valid_rgs} valid RGs")
 
     elif anti_leak_mode == 'timestamp':
-        logging.info("【v9.2-anti-leak】Sorting row groups by timestamp...")
+        logging.info("【v10-anti-leak】Sorting row groups by timestamp...")
         rg_info.sort(key=lambda x: x[3])
         n_valid_rows = max(1, int(total_rows * valid_ratio))
         cum_rows = 0
@@ -884,10 +884,10 @@ def get_pcvr_data(
         train_rgs = rg_info[:split_idx]
         valid_rgs = rg_info[split_idx:]
         split_timestamp = valid_rgs[0][3] if valid_rgs else float('inf')
-        logging.info(f"【v9.2-anti-leak】Temporal split at timestamp={split_timestamp}")
+        logging.info(f"【v10-anti-leak】Temporal split at timestamp={split_timestamp}")
 
     elif anti_leak_mode == 'user_id':
-        logging.info("【v9.2-anti-leak】Performing user-level split...")
+        logging.info("【v10-anti-leak】Performing user-level split...")
         user_rg_map = {}
         for f, rg_idx, _, _, _ in rg_info:
             pf = pq.ParquetFile(f)
@@ -911,7 +911,7 @@ def get_pcvr_data(
             valid_rg_set.update(user_rg_map[uid])
         overlap = train_rg_set & valid_rg_set
         if overlap:
-            logging.warning(f"【v9.2-anti-leak】{len(overlap)} row groups overlap, assigning to train")
+            logging.warning(f"【v10-anti-leak】{len(overlap)} row groups overlap, assigning to train")
             valid_rg_set -= overlap
             train_rg_set |= overlap
         train_rgs = [r for r in rg_info if (r[0], r[1]) in train_rg_set]
@@ -921,7 +921,7 @@ def get_pcvr_data(
             split_timestamp = valid_rgs_sorted[0][3]
         else:
             split_timestamp = float('inf')
-        logging.info(f"【v9.2-anti-leak】User split: {len(train_users)} train, {len(valid_users)} valid")
+        logging.info(f"【v10-anti-leak】User split: {len(train_users)} train, {len(valid_users)} valid")
 
     train_vocab = _build_vocab_from_rgs(train_rgs, schema_path) if anti_leak_mode != 'none' else None
 
@@ -974,7 +974,7 @@ def get_pcvr_data(
         pin_memory=use_cuda,
     )
 
-    logging.info(f"【v9.2-anti-leak】Final: train={sum(r[2] for r in train_rgs)} rows, "
+    logging.info(f"【v10-anti-leak】Final: train={sum(r[2] for r in train_rgs)} rows, "
                  f"valid={sum(r[2] for r in valid_rgs)} rows")
 
     return train_loader, valid_loader, train_dataset
@@ -1011,5 +1011,5 @@ def _build_vocab_from_rgs(rg_list, schema_path):
         except Exception as e:
             logging.debug(f"Skip RG {rg_idx} in {fpath}: {e}")
 
-    logging.info(f"【v9.2-anti-leak】Built vocab from train set: {len(vocab_sizes)} columns")
+    logging.info(f"【v10-anti-leak】Built vocab from train set: {len(vocab_sizes)} columns")
     return vocab_sizes

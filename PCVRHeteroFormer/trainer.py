@@ -1,11 +1,13 @@
 """
-PCVRHeteroFormer Trainer v9.3 - Overfit-Aware & Generative Fusion
-===================================================================
-v9.3修改内容：
-1. MetaAligner: 传入valid/train AUC，过拟合时自动提升辅助任务权重
-2. 生成模块: diff/energy的gen_repr梯度流入共享层，正则化主表示
-3. TensorBoard: 新增生成门控监控、过拟合信号监控
-4. evaluate: 记录valid_auc历史供MetaAligner使用
+PCVRHeteroFormer Trainer v10 - Generative Semantics & Decoupled Optimization
+==============================================================================
+v10 修改核心：
+1. 生成模块（prototype + diffusion_explainer + energy_calibrator）自监督解耦：
+   - 所有生成输出进入 CTR 路径前均已 detach()
+   - 生成模块仅通过 ib/recon/ortho/packing/energy_ranking loss 训练
+2. 单次 total_loss backward，通过架构 detach 实现梯度隔离（无需多步 backward）
+3. MetaAligner 简化：仅输出 aux_weight 控制生成模块总权重
+4. TensorBoard 新增生成模块诊断指标（ib/recon/ortho/diff_quality/energy）
 """
 
 import os
@@ -29,7 +31,7 @@ from model import ModelInput
 
 
 # ==============================================================================
-# v9.1: AdaptiveFocalLoss (preserved)
+# v10: AdaptiveFocalLoss (preserved)
 # ==============================================================================
 
 class AdaptiveFocalLoss(nn.Module):
@@ -117,7 +119,7 @@ class AdaptiveFocalLoss(nn.Module):
 
 
 # ==============================================================================
-# v9.1: IsolatedOptimizer (preserved)
+# v10: IsolatedOptimizer（简化分组：shared / gen / sparse / meta）
 # ==============================================================================
 
 class IsolatedOptimizer:
@@ -126,9 +128,7 @@ class IsolatedOptimizer:
 
         shared_params = (
             groups.get('shared_encoder', []) + groups.get('seq_encoder', []) +
-            groups.get('cross_field', []) + groups.get('proto_cond', []) +
-            groups.get('ctr_head', []) + groups.get('task_proj_ctr', []) +
-            groups.get('fp', [])
+            groups.get('cross_field', []) + groups.get('ctr_head', [])
         )
         self.shared_opt = torch.optim.AdamW(
             shared_params, lr=lr, betas=(0.9, 0.98), weight_decay=1e-4,
@@ -140,50 +140,29 @@ class IsolatedOptimizer:
         else:
             self.sparse_opt = None
 
-        diff_params = groups.get('diff_head', []) + groups.get('task_proj_diff', [])
-        self.diff_opt = torch.optim.AdamW(
-            diff_params, lr=lr * 0.5,
+        gen_params = groups.get('gen_module', [])
+        self.gen_opt = torch.optim.AdamW(
+            gen_params, lr=lr * 0.3,
             betas=(0.9, 0.98), weight_decay=1e-4,
-        ) if diff_params else None
-
-        energy_params = groups.get('energy_head', []) + groups.get('task_proj_energy', [])
-        self.energy_opt = torch.optim.AdamW(
-            energy_params, lr=lr * 0.3,
-            betas=(0.9, 0.98), weight_decay=1e-4,
-        ) if energy_params else None
-
-        self.geo_opt = torch.optim.SGD(
-            groups.get('proto_geo', []), lr=0.01, momentum=0.9
-        ) if groups.get('proto_geo') else None
+        ) if gen_params else None
 
         self.meta_opt = torch.optim.Adam(
             groups.get('meta', []), lr=1e-3,
         ) if groups.get('meta') else None
 
-        self.disc_opt = torch.optim.Adam(
-            groups.get('disc', []), lr=lr * 0.1,
-        ) if groups.get('disc') else None
-
         self.step_count = 0
         self.grad_norm_history = {
             name: deque(maxlen=100)
-            for name in ['ctr', 'diff', 'energy', 'geo', 'fp']
+            for name in ['ctr', 'gen']
         }
-
         self.nan_recovery_count = 0
 
     def zero_grad_shared(self):
         if self.shared_opt: self.shared_opt.zero_grad()
         if self.sparse_opt: self.sparse_opt.zero_grad()
 
-    def zero_grad_diff(self):
-        if self.diff_opt: self.diff_opt.zero_grad()
-
-    def zero_grad_energy(self):
-        if self.energy_opt: self.energy_opt.zero_grad()
-
-    def zero_grad_geo(self):
-        if self.geo_opt: self.geo_opt.zero_grad()
+    def zero_grad_gen(self):
+        if self.gen_opt: self.gen_opt.zero_grad()
 
     def zero_grad_meta(self):
         if self.meta_opt: self.meta_opt.zero_grad()
@@ -195,20 +174,10 @@ class IsolatedOptimizer:
         if self.sparse_opt:
             self.sparse_opt.step()
 
-    def step_diff(self):
-        if self.diff_opt:
-            torch.nn.utils.clip_grad_norm_(self.diff_opt.param_groups[0]['params'], 1.0)
-            self.diff_opt.step()
-
-    def step_energy(self):
-        if self.energy_opt:
-            torch.nn.utils.clip_grad_norm_(self.energy_opt.param_groups[0]['params'], 1.0)
-            self.energy_opt.step()
-
-    def step_geo(self):
-        if self.geo_opt:
-            torch.nn.utils.clip_grad_norm_(self.geo_opt.param_groups[0]['params'], 2.0)
-            self.geo_opt.step()
+    def step_gen(self):
+        if self.gen_opt:
+            torch.nn.utils.clip_grad_norm_(self.gen_opt.param_groups[0]['params'], 1.0)
+            self.gen_opt.step()
 
     def step_meta(self):
         if self.meta_opt:
@@ -237,8 +206,7 @@ class IsolatedOptimizer:
                 else:
                     nn.init.normal_(p, std=0.01)
 
-                for opt in [self.shared_opt, self.sparse_opt, self.diff_opt,
-                           self.energy_opt, self.geo_opt, self.meta_opt, self.disc_opt]:
+                for opt in [self.shared_opt, self.sparse_opt, self.gen_opt, self.meta_opt]:
                     if opt is not None:
                         for state_name in list(opt.state.keys()):
                             if state_name is p:
@@ -257,11 +225,8 @@ class IsolatedOptimizer:
         return {
             'shared': self.shared_opt.state_dict() if self.shared_opt else None,
             'sparse': self.sparse_opt.state_dict() if self.sparse_opt else None,
-            'diff': self.diff_opt.state_dict() if self.diff_opt else None,
-            'energy': self.energy_opt.state_dict() if self.energy_opt else None,
-            'geo': self.geo_opt.state_dict() if self.geo_opt else None,
+            'gen': self.gen_opt.state_dict() if self.gen_opt else None,
             'meta': self.meta_opt.state_dict() if self.meta_opt else None,
-            'disc': self.disc_opt.state_dict() if self.disc_opt else None,
             'step_count': self.step_count,
             'nan_recovery_count': self.nan_recovery_count,
         }
@@ -269,9 +234,7 @@ class IsolatedOptimizer:
     def load_state_dict(self, state_dict):
         for name, opt in [
             ('shared', self.shared_opt), ('sparse', self.sparse_opt),
-            ('diff', self.diff_opt), ('energy', self.energy_opt),
-            ('geo', self.geo_opt), ('meta', self.meta_opt),
-            ('disc', self.disc_opt),
+            ('gen', self.gen_opt), ('meta', self.meta_opt),
         ]:
             if opt and name in state_dict and state_dict[name]:
                 opt.load_state_dict(state_dict[name])
@@ -280,7 +243,7 @@ class IsolatedOptimizer:
 
 
 # ==============================================================================
-# v9.3: Trainer — 过拟合感知 + 生成融合
+# v10: Trainer
 # ==============================================================================
 
 class PCVRHeteroFormerTrainer:
@@ -314,16 +277,13 @@ class PCVRHeteroFormerTrainer:
         focal_alpha_neg: float = 0.5,
         focal_max_gamma: float = 4.0,
         global_ctr: float = 0.01,
-        use_diffusion: bool = True,
-        use_energy: bool = True,
-        use_domain_adversarial: bool = False,
         packing_weight: float = 0.01,
         energy_margin: float = 1.0,
         energy_weight: float = 0.1,
-        diff_weight: float = 0.05,
-        meta_update_interval: int = 100,
-        curriculum_warmup: int = 5000,
-        diffusion_warmup: int = 1000,
+        ib_weight: float = 0.01,
+        recon_weight: float = 0.05,
+        ortho_weight: float = 0.01,
+        **kwargs,  # 吸收旧版兼容参数
     ) -> None:
         self.model = model
         self.train_loader = train_loader
@@ -332,15 +292,12 @@ class PCVRHeteroFormerTrainer:
         self.lr = lr
         self.warmup_steps = warmup_steps
         self.global_step = 0
-        self.use_diffusion = use_diffusion
-        self.use_energy = use_energy
         self.packing_weight = packing_weight
         self.energy_margin = energy_margin
         self.energy_weight = energy_weight
-        self.diff_weight = diff_weight
-        self.meta_update_interval = meta_update_interval
-        self.curriculum_warmup = curriculum_warmup
-        self.diffusion_warmup = diffusion_warmup
+        self.ib_weight = ib_weight
+        self.recon_weight = recon_weight
+        self.ortho_weight = ortho_weight
 
         self.optimizer = IsolatedOptimizer(model, lr, sparse_lr)
 
@@ -360,10 +317,9 @@ class PCVRHeteroFormerTrainer:
         self.train_config = train_config
 
         self.last_val_auc = 0.0
-        self.meta_alpha = {'ctr': 1.0, 'diff': 0.0, 'energy': 0.0}
         self.loss_history = deque(maxlen=100)
 
-        # 【v9.3】AUC历史供MetaAligner过拟合检测
+        # AUC历史供MetaAligner使用
         self.train_auc_history = deque(maxlen=5)
         self.valid_auc_history = deque(maxlen=5)
 
@@ -403,14 +359,6 @@ class PCVRHeteroFormerTrainer:
             seq_timestamps_raw=seq_timestamps_raw if seq_timestamps_raw else None,
         )
 
-    def _energy_margin_loss(self, energy: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        pos_mask = labels.unsqueeze(1)
-        neg_mask = (1.0 - labels).unsqueeze(0)
-        valid_pairs = pos_mask * neg_mask
-        margin_matrix = F.relu(energy.unsqueeze(1) - energy.unsqueeze(0) + self.energy_margin)
-        loss = (margin_matrix * valid_pairs).sum() / (valid_pairs.sum() + 1e-8)
-        return loss
-
     def _train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
         device_batch = self._batch_to_device(batch)
         labels = device_batch['label'].float()
@@ -419,90 +367,93 @@ class PCVRHeteroFormerTrainer:
         self.optimizer.check_and_recover_nan_params(self.model)
 
         # ================================================================
-        # Phase 1: CTR Forward
+        # Phase 0: 清零所有梯度
+        # ================================================================
+        self.optimizer.zero_grad_shared()
+        self.optimizer.zero_grad_gen()
+        self.optimizer.zero_grad_meta()
+
+        # ================================================================
+        # Phase 1: CTR Forward（生成模块内联，输出已 detach）
         # ================================================================
         self.model.train()
         out = self.model(model_input, task_id='ctr')
 
-        if isinstance(out, tuple) and len(out) == 7 and isinstance(out[-1], dict):
-            logits, proto_weights, proto_repr, kappa_mean, assign_entropy, gen_gates, uncertainty_pkg = out
-        else:
-            logits, proto_weights, proto_repr, kappa_mean, assign_entropy, gen_gates = out
-            uncertainty_pkg = {}
+        # 解包 12 元素 v10 返回
+        (
+            logits, proto_weights, proto_repr, kappa_mean, assign_entropy,
+            diff_explain, diff_quality, ib_loss, energy_score, recon_loss, ortho_loss, packing_loss
+        ) = out
 
         logits = logits.squeeze(-1)
 
         # ================================================================
-        # Phase 2: 提前计算辅助任务 loss（用于 MetaAligner V2 加权）
-        # ================================================================
-        loss_diff = torch.tensor(0.0, device=self.device)
-        loss_energy = torch.tensor(0.0, device=self.device)
-
-        if self.use_diffusion:
-            pred_noise, target_noise, t = self.model(model_input, task_id='diff')
-            loss_diff_raw = F.mse_loss(pred_noise, target_noise)
-            loss_diff = torch.clamp(loss_diff_raw, max=10.0)
-
-        if self.use_energy:
-            energy = self.model(model_input, task_id='energy')
-            loss_energy_raw = self._energy_margin_loss(energy, labels)
-            loss_energy = torch.clamp(loss_energy_raw, max=10.0)
-
-        # ================================================================
-        # Phase 3: MetaAligner V2 决策
-        # ================================================================
-        valid_auc = self.valid_auc_history[-1] if self.valid_auc_history else None
-        train_auc_latest = self.train_auc_history[-1] if self.train_auc_history else None
-
-        # 计算当前 grad_norms（用于 MetaAligner）
-        grad_norms = self.optimizer.get_grad_norms()
-
-        meta = self.model.meta_aligner(
-            losses={'ctr': 0.0, 'diff': loss_diff.item(), 'energy': loss_energy.item()},
-            grad_norms=grad_norms,
-            valid_auc=valid_auc,
-            train_auc=train_auc_latest,
-            global_step=self.global_step,
-        )
-
-        # V2: 直接使用返回的权重
-        aux_weight = meta['aux_weight']
-        diff_weight = meta['diff_weight']
-        energy_weight = meta['energy_weight']
-        ctr_weight = meta['ctr_weight']
-
-        # ================================================================
-        # Phase 4: 总 Loss 计算与 Backward
+        # Phase 2: CTR loss（仅优化 shared 路径）
         # ================================================================
         if self.adaptive_focal is not None:
             loss_ctr = self.adaptive_focal(logits, labels)
         else:
             loss_ctr = F.binary_cross_entropy_with_logits(logits, labels)
 
-        # 序列融合熵正则（手术1）
-        entropy_loss = getattr(self.model, '_cached_entropy_loss', torch.tensor(0.0, device=self.device))
-        if torch.isnan(entropy_loss) or torch.isinf(entropy_loss):
-            entropy_loss = torch.tensor(0.0, device=self.device)
+        # ================================================================
+        # Phase 3: 生成模块自监督 loss（仅优化 gen_module）
+        # ================================================================
+        # Energy ranking loss（自监督对比）
+        loss_energy_rank = torch.tensor(0.0, device=self.device)
+        if torch.is_tensor(energy_score) and energy_score.requires_grad:
+            loss_energy_rank = self.model.energy_calibrator.compute_ranking_loss(
+                energy_score, labels, self.energy_margin
+            )
+            if not loss_energy_rank.requires_grad:
+                loss_energy_rank = torch.tensor(0.0, device=self.device)
 
-        # V2: 单一总 loss 加权
-        total_loss = (ctr_weight * loss_ctr + 
-                      diff_weight * loss_diff + 
-                      energy_weight * loss_energy + 
-                      0.01 * entropy_loss)
+        loss_gen = (
+            self.ib_weight * ib_loss +
+            self.recon_weight * recon_loss +
+            self.ortho_weight * ortho_loss +
+            self.packing_weight * packing_loss +
+            self.energy_weight * loss_energy_rank
+        )
 
-        # NaN 检查
+        # ================================================================
+        # Phase 4: MetaAligner 决策（仅输出 aux_weight）
+        # ================================================================
+        valid_auc = self.valid_auc_history[-1] if self.valid_auc_history else None
+        train_auc_latest = self.train_auc_history[-1] if self.train_auc_history else None
+        grad_norms = self.optimizer.get_grad_norms()
+
+        meta = self.model.meta_aligner(
+            losses={'ctr': loss_ctr.item(), 'gen': loss_gen.item()},
+            grad_norms=grad_norms,
+            valid_auc=valid_auc,
+            train_auc=train_auc_latest,
+            global_step=self.global_step,
+            ctr_loss=loss_ctr.item(),
+            uncertainty_mean=energy_score.mean().item() if torch.is_tensor(energy_score) else 0.0,
+            diff_quality=diff_quality.mean().item() if torch.is_tensor(diff_quality) else 0.5,
+        )
+
+        aux_weight = meta['aux_weight']
+
+        # ================================================================
+        # Phase 5: 总 Loss 与单次 Backward（架构 detach 保证梯度隔离）
+        # ================================================================
+        total_loss = loss_ctr + aux_weight * loss_gen
+
+        # NaN 安全
         total_loss = torch.where(
             torch.isnan(total_loss) | torch.isinf(total_loss),
             torch.tensor(0.0, device=total_loss.device),
             total_loss
         )
 
-        # 梯度检查与 backward
-        self.optimizer.zero_grad_shared()
-        total_loss.backward(retain_graph=True)
+        total_loss.backward()
 
-        ctr_grad_norm = 0.0
+        # ================================================================
+        # Phase 6: 梯度检查与参数更新
+        # ================================================================
         has_nan_grad = False
+        ctr_grad_norm = 0.0
         for p in self.model.parameters():
             if p.grad is not None:
                 if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
@@ -514,25 +465,18 @@ class PCVRHeteroFormerTrainer:
         if has_nan_grad:
             logging.warning(f"【梯度爆炸】Step {self.global_step} 检测到NaN/Inf梯度，跳过参数更新")
             self.optimizer.zero_grad_shared()
+            self.optimizer.zero_grad_gen()
             grad_norm_ctr = 0.0
         else:
             self.optimizer.record_grad_norm('ctr', self.model)
+            self.optimizer.record_grad_norm('gen', self.model)
             self.optimizer.step_shared()
+            if loss_gen.item() > 0:
+                self.optimizer.step_gen()
             grad_norm_ctr = self.optimizer.grad_norm_history['ctr'][-1] if self.optimizer.grad_norm_history['ctr'] else 0.0
 
         # ================================================================
-        # Phase 5: Geometry 始终激活（packing loss）
-        # ================================================================
-        loss_packing = self.model.get_packing_loss()
-        loss_packing = torch.clamp(loss_packing, max=10.0)
-        if not (torch.isnan(loss_packing) or torch.isinf(loss_packing)):
-            self.optimizer.zero_grad_geo()
-            loss_packing.backward()
-            self.optimizer.record_grad_norm('geo', self.model)
-            self.optimizer.step_geo()
-
-        # ================================================================
-        # Phase 6: 更新历史 & Logging
+        # Phase 7: 更新历史 & Logging
         # ================================================================
         if self.adaptive_focal is not None:
             self.adaptive_focal.step()
@@ -552,12 +496,15 @@ class PCVRHeteroFormerTrainer:
 
         self.train_auc_history.append(train_auc)
 
-        # TensorBoard
+        # TensorBoard logging
         if self.writer:
             self.writer.add_scalar('Loss/ctr', loss_ctr.item(), self.global_step)
-            self.writer.add_scalar('Loss/diff', loss_diff.item(), self.global_step)
-            self.writer.add_scalar('Loss/energy', loss_energy.item(), self.global_step)
-            self.writer.add_scalar('Loss/packing', loss_packing.item(), self.global_step)
+            self.writer.add_scalar('Loss/gen', loss_gen.item(), self.global_step)
+            self.writer.add_scalar('Loss/ib', ib_loss.item(), self.global_step)
+            self.writer.add_scalar('Loss/recon', recon_loss.item(), self.global_step)
+            self.writer.add_scalar('Loss/ortho', ortho_loss.item(), self.global_step)
+            self.writer.add_scalar('Loss/packing', packing_loss.item(), self.global_step)
+            self.writer.add_scalar('Loss/energy_rank', loss_energy_rank.item(), self.global_step)
             self.writer.add_scalar('Loss/total', total_loss.item(), self.global_step)
             self.writer.add_scalar('Stream/logits_mean', logits_mean, self.global_step)
             self.writer.add_scalar('Stream/logits_std', logits_std, self.global_step)
@@ -567,36 +514,28 @@ class PCVRHeteroFormerTrainer:
             self.writer.add_scalar('Proto/kappa_mean', kappa_mean.item(), self.global_step)
             self.writer.add_scalar('Proto/assign_entropy', assign_entropy.mean().item(), self.global_step)
 
-            # MetaAligner V2 监控
-            mode_map = {'warmup': 0, 'probe_burn_in': 1, 'train_schedule': 2, 
-                       'hybrid': 3, 'valid_pid': 4, 'interpolated': 5, 'unknown': -1}
-            self.writer.add_scalar('Meta/mode', mode_map.get(meta.get('mode', 'unknown'), -1), self.global_step)
+            self.writer.add_scalar('Meta/mode', 0 if meta.get('mode') == 'valid_pid' else 1, self.global_step)
             self.writer.add_scalar('Meta/gap', meta.get('gap', 0.0), self.global_step)
             self.writer.add_scalar('Meta/aux_weight', meta.get('aux_weight', 0.0), self.global_step)
-            self.writer.add_scalar('Meta/ctr_weight', meta.get('ctr_weight', 1.0), self.global_step)
-            self.writer.add_scalar('Meta/diff_weight', meta.get('diff_weight', 0.0), self.global_step)
-            self.writer.add_scalar('Meta/energy_weight', meta.get('energy_weight', 0.0), self.global_step)
             self.writer.add_scalar('Meta/ema_aux', meta.get('ema_aux', 0.0), self.global_step)
             self.writer.add_scalar('Meta/steps_since_valid', meta.get('steps_since_valid', 0), self.global_step)
 
-            # 手术1: 序列融合门控监控
+            self.writer.add_scalar('Gen/ib_loss', ib_loss.item(), self.global_step)
+            self.writer.add_scalar('Gen/recon_loss', recon_loss.item(), self.global_step)
+            self.writer.add_scalar('Gen/ortho_loss', ortho_loss.item(), self.global_step)
+            self.writer.add_scalar('Gen/diff_quality', diff_quality.mean().item(), self.global_step)
+            self.writer.add_scalar('Gen/energy_mean', energy_score.mean().item() if torch.is_tensor(energy_score) else 0.0, self.global_step)
+
             if hasattr(self.model, '_cached_seq_gate_short') and self.model._cached_seq_gate_short is not None:
                 gate_short = self.model._cached_seq_gate_short
                 for i, domain in enumerate(self.model.seq_domains):
                     if i < gate_short.size(1):
-                        self.writer.add_scalar(f'SeqFusion/short_{domain}', 
+                        self.writer.add_scalar(f'SeqFusion/short_{domain}',
                                               gate_short[:, i].mean().item(), self.global_step)
 
-            # 手术2: 显式交叉监控（如果有）
             if hasattr(self.model, 'explicit_cross') and self.model.explicit_cross is not None:
                 cross_norm = self.model.explicit_cross.cross_weights.norm().item()
                 self.writer.add_scalar('CrossLayer/weight_norm', cross_norm, self.global_step)
-
-            # Gen 门控监控
-            if gen_gates is not None:
-                self.writer.add_scalar('Gen/gate_proto', gen_gates[:, 0].mean().item(), self.global_step)
-                self.writer.add_scalar('Gen/gate_diff', gen_gates[:, 1].mean().item(), self.global_step)
-                self.writer.add_scalar('Gen/gate_energy', gen_gates[:, 2].mean().item(), self.global_step)
 
         # Console log
         if self.global_step % 100 == 0:
@@ -604,9 +543,12 @@ class PCVRHeteroFormerTrainer:
                 f"[Step {self.global_step}]",
                 f"mode={meta.get('mode', '?')}",
                 f"ctr={loss_ctr.item():.4f}",
-                f"diff={loss_diff.item():.4f}",
-                f"energy={loss_energy.item():.4f}",
-                f"pack={loss_packing.item():.4f}",
+                f"gen={loss_gen.item():.4f}",
+                f"ib={ib_loss.item():.4f}",
+                f"recon={recon_loss.item():.4f}",
+                f"ortho={ortho_loss.item():.4f}",
+                f"pack={packing_loss.item():.4f}",
+                f"e_rank={loss_energy_rank.item():.4f}",
                 f"total={total_loss.item():.4f}",
                 f"logits={logits_mean:.3f}±{logits_std:.3f}",
                 f"trAUC={train_auc:.4f}",
@@ -614,22 +556,21 @@ class PCVRHeteroFormerTrainer:
                 f"ent={assign_entropy.mean().item():.2f}",
                 f"grad={grad_norm_ctr:.2f}",
                 f"nanR={self.optimizer.nan_recovery_count}",
-                f"meta=[{meta.get('ctr_weight', 1.0):.2f},{meta.get('diff_weight', 0.0):.2f},{meta.get('energy_weight', 0.0):.2f}]",
-                f"aux_w={meta.get('aux_weight', 0.0):.3f}",
+                f"meta=[ctr=1.0,aux={meta.get('aux_weight', 0.0):.3f}]",
                 f"gap={meta.get('gap', 0.0):.3f}",
-                f"ema={meta.get('ema_aux', 0.0):.3f}",
+                f"diffQ={diff_quality.mean().item():.3f}",
+                f"energy={energy_score.mean().item():.3f}" if torch.is_tensor(energy_score) else "energy=0.0",
             ]
-            if gen_gates is not None:
-                log_parts.append(
-                    f"genG=[{gen_gates[:, 0].mean():.2f},{gen_gates[:, 1].mean():.2f},{gen_gates[:, 2].mean():.2f}]"
-                )
             logging.info(" | ".join(log_parts))
 
         return {
             'loss_ctr': loss_ctr.item(),
-            'loss_diff': loss_diff.item(),
-            'loss_energy': loss_energy.item(),
-            'loss_packing': loss_packing.item(),
+            'loss_gen': loss_gen.item(),
+            'loss_ib': ib_loss.item(),
+            'loss_recon': recon_loss.item(),
+            'loss_ortho': ortho_loss.item(),
+            'loss_packing': packing_loss.item(),
+            'loss_energy_rank': loss_energy_rank.item(),
             'total_loss': total_loss.item(),
             'train_auc': train_auc,
             'meta_mode': meta.get('mode', 'unknown'),
@@ -679,7 +620,6 @@ class PCVRHeteroFormerTrainer:
             all_logits.float(), all_labels.float()
         ).item()
 
-        # 记录 valid AUC 历史（关键：供 MetaAligner 使用）
         self.valid_auc_history.append(auc)
         return auc, logloss
 
@@ -701,7 +641,7 @@ class PCVRHeteroFormerTrainer:
         return ckpt_dir
 
     def train(self) -> None:
-        logging.info("Start training HeteroFormer v9.3 (Overfit-Aware + Generative Fusion)")
+        logging.info("Start training HeteroFormer v10 (Generative Semantics & Decoupled Optimization)")
         self.model.train()
         total_step = 0
 
@@ -723,7 +663,7 @@ class PCVRHeteroFormerTrainer:
 
                 train_pbar.set_postfix({
                     "ctr": f"{losses['loss_ctr']:.4f}",
-                    "diff": f"{losses['loss_diff']:.4f}",
+                    "gen": f"{losses['loss_gen']:.4f}",
                     "auc": f"{losses['train_auc']:.4f}",
                     "nan": nan_count,
                     "nanR": self.optimizer.nan_recovery_count,

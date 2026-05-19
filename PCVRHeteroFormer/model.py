@@ -1,11 +1,17 @@
-"""
-PCVRHeteroFormer v9.3 - Generative Fusion & Overfit-Aware MetaAligner
-======================================================================
-v9.3核心修改：
-1. MetaAligner: 基于valid/train AUC过拟合检测的动态任务权重，移除硬编码step_ratio冻结
-2. DiffusionHead/EnergyHead: 新增get_gen_repr()路径，输出生成式语义表示（不detach）
-3. GenerativeFusion: 融合原型/扩散/能量三种表示，门控机制供CTR使用
-4. CTR路径: 训练时使用融合表示，eval时回退到原始proto_repr（保证确定性）
+"""PCVRHeteroFormer v10 - Generative Semantics & Proto-Conditioned Interaction
+================================================================================
+v10 核心架构（严格遵循修改意见框架）：
+1. 基础编码层：MultiViewEncoder + ContinuousSequenceEncoder + MultiSeqFusion
+2. 生成式语义层：DynamicPrototypeManifold + DiffusionExplainer + EnergyCalibrator
+   - 【自监督训练】IB loss + recon loss + ortho loss + packing loss
+   - 【不直接参与 CTR 梯度】所有生成输出进入 CTR 路径前均 detach()
+3. 特征交互层：BilinearCrossLayer + ProtoConditionedCrossFieldNet
+   - proto_weights → 场注意力偏置（温和注入）
+   - diff_explain  → FFN 场门控（可选）
+   - energy_score   → 不参与训练，仅 eval 校准
+4. 预测层：CalibratedCTRHead
+   - eval 时以 energy_score 做动态 logit 校准
+5. MetaAligner：过拟合感知，仅输出 aux_weight 控制生成模块总权重
 """
 
 import math
@@ -128,18 +134,19 @@ class PoolConcatLinear(nn.Module):
 
 
 # ==============================================================================
-# v9.3: MultiViewEncoder (preserved)
+# v10: MultiViewEncoder (preserved)
 # ==============================================================================
 
 class MultiViewEncoder(nn.Module):
     def __init__(self, user_int_feature_specs, item_int_feature_specs, user_dense_dim, item_dense_dim,
-                 d_model=128, emb_dim=16, id_vocab_threshold=10000, emb_skip_threshold=0, task_dims=None):
+                 d_model=128, emb_dim=16, id_vocab_threshold=10000, emb_skip_threshold=0, task_dims=None, dropout_rate=0.15):
         super().__init__()
         self.d_model = d_model
         self.user_int_feature_specs = user_int_feature_specs
         self.item_int_feature_specs = item_int_feature_specs
         task_dims = task_dims or {'ctr': d_model, 'diff': d_model, 'energy': d_model}
         self.task_names = sorted(task_dims.keys())
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
 
         user_intra = {}
         user_dims = {}
@@ -214,6 +221,7 @@ class MultiViewEncoder(nn.Module):
 
         context_feat = user_feat + item_feat
         z_shared = self.fusion_norm(user_feat + item_feat + context_feat)
+        z_shared = self.dropout(z_shared)
 
         views = {task_name: self.view_projs[task_name](z_shared) for task_name in self.task_names}
 
@@ -221,7 +229,7 @@ class MultiViewEncoder(nn.Module):
 
 
 # ==============================================================================
-# v9.1: SSMCell (preserved)
+# v10: SSMCell (preserved)
 # ==============================================================================
 
 class SSMCell(nn.Module):
@@ -266,58 +274,44 @@ class SSMCell(nn.Module):
 
         return y
 
+
 class BilinearCrossLayer(nn.Module):
     """
-    轻量级双线性交叉层：捕获域间二阶交互
-    只保留上三角交互，避免参数量爆炸
+    轻量级双线性交叉层：捕获域间二阶交互（上三角，避免参数量爆炸）
     """
     def __init__(self, d_model: int, num_fields: int = 4, cross_ratio: float = 0.1):
         super().__init__()
         self.d_model = d_model
         self.num_fields = num_fields
-        self.cross_ratio = cross_ratio  # 交叉项残差比例，避免主导
-        
-        # 上三角交互参数：[i, j, d] for i < j
+        self.cross_ratio = cross_ratio
         num_pairs = num_fields * (num_fields - 1) // 2
         self.cross_weights = nn.Parameter(torch.randn(num_pairs, d_model) * 0.01)
-        
-        # 输出投影（稳定训练）
         self.output_norm = nn.LayerNorm(d_model)
-        
+
     def forward(self, fields: List[Tensor]) -> List[Tensor]:
-        """
-        Args:
-            fields: List[Tensor]，每个 [B, D]，如 [user_feat, item_feat, context_feat, seq_feat]
-        Returns:
-            交叉增强后的场表示，残差形式
-        """
         num_actual = len(fields)
         if num_actual < 2:
             return fields
-        
+
         out = [f.clone() for f in fields]
         pair_idx = 0
-        
         for i in range(num_actual):
             for j in range(i + 1, num_actual):
-                # 逐元素交互：[B, D] * [D] * [B, D] -> [B, D]
                 interaction = fields[i] * self.cross_weights[pair_idx] * fields[j]
-                
-                # 残差叠加，避免主导原始表示
                 out[i] = out[i] + self.cross_ratio * interaction
                 out[j] = out[j] + self.cross_ratio * interaction
                 pair_idx += 1
-        
-        # 归一化稳定
+
         out = [self.output_norm(o) for o in out]
         return out
 
+
 # ==============================================================================
-# v9.1: ContinuousSequenceEncoder (preserved)
+# v10: ContinuousSequenceEncoder (preserved)
 # ==============================================================================
 
 class ContinuousSequenceEncoder(nn.Module):
-    def __init__(self, vocab_sizes, d_model=128, state_dim=64, num_layers=2, max_seq_len=512, id_threshold=10000):
+    def __init__(self, vocab_sizes, d_model=128, state_dim=64, num_layers=2, max_seq_len=512, id_threshold=10000, dropout_rate=0.15):
         super().__init__()
         self.d_model = d_model
         self.max_seq_len = max_seq_len
@@ -338,6 +332,7 @@ class ContinuousSequenceEncoder(nn.Module):
         self.long_proj = nn.Linear(d_model, d_model)
         self.static_proj = nn.Linear(d_model * 3, d_model)
         self.output_norm = nn.LayerNorm(d_model)
+        self.seq_dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
 
     def forward(self, seq_ids, seq_lens, time_buckets=None, decay_weight=None, timestamps_raw=None):
         B, n_feats, max_len = seq_ids.shape
@@ -345,6 +340,7 @@ class ContinuousSequenceEncoder(nn.Module):
         feat_embs = [self.feat_embs[i](seq_ids[:, i, :]) for i in range(n_feats)]
         seq_repr = torch.cat(feat_embs, dim=-1)
         seq_repr = self.seq_norm(self.seq_proj(seq_repr))
+        seq_repr = self.seq_dropout(seq_repr)
 
         if timestamps_raw is not None:
             time_deltas = torch.zeros(B, max_len, 1, device=device)
@@ -362,6 +358,7 @@ class ContinuousSequenceEncoder(nn.Module):
             hidden = ssm(hidden, time_deltas)
             hidden = norm(hidden + residual)
             hidden = torch.nan_to_num(hidden, nan=0.0, posinf=1e4, neginf=-1e4)
+            hidden = self.seq_dropout(hidden)
 
         positions = torch.arange(max_len, device=device).unsqueeze(0)
         lens_expanded = seq_lens.unsqueeze(1)
@@ -394,27 +391,28 @@ class ContinuousSequenceEncoder(nn.Module):
         return {'short': self.output_norm(s_short), 'long': self.output_norm(s_long),
                 'static': self.output_norm(s_static), 'full_seq': hidden}
 
+
 class MultiSeqFusion(nn.Module):
     def __init__(self, d_model: int, num_domains: int, num_heads: int = 4):
         super().__init__()
         self.d_model = d_model
         self.num_domains = num_domains
-        
+
         self.domain_projs = nn.ModuleList([
             nn.Sequential(
                 nn.LayerNorm(d_model),
                 nn.Linear(d_model, d_model),
             ) for _ in range(num_domains)
         ])
-        
+
         self.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
         self.query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
-        
+
         self.output_proj = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
         )
-        
+
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=0.1)
@@ -425,32 +423,32 @@ class MultiSeqFusion(nn.Module):
         if len(seq_reprs) == 0:
             B = 1
             return torch.zeros(B, self.d_model, device=next(self.parameters()).device), None, torch.tensor(0.0)
-        
+
         B = seq_reprs[0].size(0)
         device = seq_reprs[0].device
-        
+
         if len(seq_reprs) == 1:
             proj = self.domain_projs[0](seq_reprs[0])
             return self.output_proj(proj), torch.ones(B, 1, device=device), torch.tensor(0.0)
-        
+
         projected = []
         for proj, r in zip(self.domain_projs[:len(seq_reprs)], seq_reprs):
             p = proj(r)
             projected.append(p)
-        
+
         stacked = torch.stack(projected, dim=1)
         query = self.query.expand(B, -1, -1)
         attn_out, attn_weights = self.attn(query, stacked, stacked)
-        
+
         gates = attn_weights.squeeze(1)
         fused = attn_out.squeeze(1)
         fused = self.output_proj(fused)
-        
+
         return fused, gates, torch.tensor(0.0, device=device)
 
 
 # ==============================================================================
-# v9.1: CayleyRotation (preserved)
+# v10: CayleyRotation (preserved)
 # ==============================================================================
 
 class CayleyRotation(nn.Module):
@@ -484,7 +482,7 @@ class CayleyRotation(nn.Module):
 
 
 # ==============================================================================
-# v9.2-final: LangevinSinkhorn (preserved)
+# v10: LangevinSinkhorn (preserved)
 # ==============================================================================
 
 class LangevinSinkhorn(nn.Module):
@@ -521,6 +519,10 @@ class LangevinSinkhorn(nn.Module):
         return Pi, entropy
 
 
+# ==============================================================================
+# v10: DynamicPrototypeManifold（移除 task_proj，添加 get_rotated_prototypes）
+# ==============================================================================
+
 class DynamicPrototypeManifold(nn.Module):
     def __init__(self, num_codes: int, code_dim: int, user_cond_dim: int,
                  kappa_base: float = 2.0, kappa_min: float = 0.5,
@@ -538,16 +540,20 @@ class DynamicPrototypeManifold(nn.Module):
         self.kappa_user_proj = nn.Linear(user_cond_dim, num_codes)
         self.kappa_time_decay = nn.Parameter(torch.tensor(0.1))
         self.empty_prior = nn.Parameter(torch.zeros(num_codes))
-        self.task_proj = nn.ModuleDict({
-            'ctr': nn.Sequential(nn.Linear(code_dim, code_dim), nn.LayerNorm(code_dim)),
-            'diff': nn.Sequential(nn.Linear(code_dim, code_dim), nn.LayerNorm(code_dim)),
-            'energy': nn.Sequential(nn.Linear(code_dim, code_dim), nn.LayerNorm(code_dim)),
-        })
+        # v10: 删除 task_proj，原型表示保持纯语义，不偏向任何下游任务
         self.sinkhorn = LangevinSinkhorn(sinkhorn_epsilon, sinkhorn_iter)
         self.coherence_threshold = coherence_threshold
 
     def get_global_prototypes(self) -> Tensor:
         return safe_normalize(self.eta)
+
+    def get_rotated_prototypes(self, user_feat: Tensor) -> Tensor:
+        """获取用户条件旋转后的原型矩阵 [B, K, D]，供 DiffusionExplainer 使用"""
+        mu_u = self.rotation.rotate(self.get_global_prototypes(), user_feat)
+        if torch.isnan(mu_u).any():
+            logging.warning("【NaN防护】CayleyRotation输出NaN，使用未旋转原型")
+            mu_u = self.get_global_prototypes().unsqueeze(0).expand(user_feat.size(0), -1, -1)
+        return mu_u
 
     def get_kappa(self, user_feat: Tensor, time_span=None) -> Tensor:
         B = user_feat.size(0)
@@ -585,10 +591,7 @@ class DynamicPrototypeManifold(nn.Module):
                 task_id: str, is_training: bool):
         self._check_and_recover_nan()
         B = z_seq.size(0)
-        mu_u = self.rotation.rotate(self.get_global_prototypes(), user_feat)
-        if torch.isnan(mu_u).any():
-            logging.warning("【NaN防护】CayleyRotation输出NaN，使用未旋转原型")
-            mu_u = self.get_global_prototypes().unsqueeze(0).expand(B, -1, -1)
+        mu_u = self.get_rotated_prototypes(user_feat)
         time_span = seq_meta.get('time_span')
         kappa = self.get_kappa(user_feat, time_span)
         z_norm = safe_normalize(z_seq)
@@ -605,8 +608,8 @@ class DynamicPrototypeManifold(nn.Module):
                                      torch.ones_like(proto_weights) / self.num_codes,
                                      proto_weights)
         proto_weights = proto_weights / (proto_weights.sum(dim=1, keepdim=True) + 1e-8)
-        mu_task = self.task_proj[task_id](mu_u.reshape(-1, self.code_dim)).reshape(B, self.num_codes, self.code_dim)
-        proto_repr = torch.einsum('bk,bkd->bd', proto_weights, mu_task)
+        # v10: 直接使用旋转原型，无任务投影
+        proto_repr = torch.einsum('bk,bkd->bd', proto_weights, mu_u)
         proto_repr = safe_normalize(proto_repr)
         if torch.isnan(proto_repr).any():
             logging.warning("【NaN防护】proto_repr NaN，回退到z_seq")
@@ -631,54 +634,123 @@ class DynamicPrototypeManifold(nn.Module):
 
 
 # ==============================================================================
-# v9.0: LangevinForceField (preserved)
+# v10: DiffusionExplainer（信息瓶颈编码器）
 # ==============================================================================
 
-class LangevinForceField(nn.Module):
-    def __init__(self, d_model: int, num_fields: int = 3, num_steps: int = 2):
+class DiffusionExplainer(nn.Module):
+    """信息瓶颈编码器：将原型-序列联合分布编码到瓶颈空间，输出可解释语义 diff_explain"""
+
+    def __init__(self, d_model: int, num_codes: int, bottleneck_dim: Optional[int] = None, dropout_rate: float = 0.15):
         super().__init__()
-        self.d_model = d_model
-        self.num_fields = num_fields
-        self.num_steps = num_steps
-        self.force_net = nn.Sequential(
-            nn.Linear(d_model * num_fields, d_model * num_fields),
-            nn.LayerNorm(d_model * num_fields), nn.SiLU(),
-            nn.Linear(d_model * num_fields, d_model * num_fields),
-        )
-        self.mass_log = nn.Parameter(torch.zeros(num_fields, d_model))
-        self.gamma_log = nn.Parameter(torch.tensor(0.0))
-        self.temperature_log = nn.Parameter(torch.tensor(0.0))
-        self.uncertainty_head = nn.Sequential(
-            nn.Linear(d_model * num_fields, d_model * num_fields), nn.SiLU(),
-            nn.Linear(d_model * num_fields, num_fields * d_model),
+        bottleneck_dim = bottleneck_dim or max(16, d_model // 4)
+        self.bottleneck_dim = bottleneck_dim
+
+        # 编码器：z_seq + proto_res_pooled + proto_weights
+        self.encoder = nn.Sequential(
+            nn.Linear(d_model * 2 + num_codes, d_model),
+            nn.LayerNorm(d_model), nn.SiLU(), nn.Dropout(dropout_rate),
+            nn.Linear(d_model, bottleneck_dim * 2),  # mu, logvar
         )
 
-    def forward(self, fields: Dict[str, Tensor], is_training: bool) -> Tuple[Dict[str, Tensor], Tensor]:
-        keys = sorted(fields.keys())
-        assert len(keys) == self.num_fields
-        q = torch.stack([fields[k] for k in keys], dim=1)
-        B, F, D = q.shape
-        p = torch.zeros(B, F, D, device=q.device)
-        M = torch.exp(self.mass_log.unsqueeze(0))
-        gamma = F.softplus(self.gamma_log)
-        T = F.softplus(self.temperature_log)
-        dt = torch.tensor(0.1, device=q.device)
-        for _ in range(self.num_steps):
-            q_half = q + 0.5 * dt * p / M
-            q_flat = q_half.reshape(B, -1)
-            force_det = self.force_net(q_flat).reshape(B, F, D)
-            noise_scale = torch.sqrt(2 * gamma * T * dt)
-            noise = create_noise_like(force_det, is_training) * noise_scale
-            force = force_det + noise
-            p = p * (1 - gamma * dt) + force * dt
-            q = q_half + 0.5 * dt * p / M
-        uncertainty = self.uncertainty_head(q_flat)
-        uncertainty = F.softplus(uncertainty).reshape(B, F, D)
-        return {k: q[:, i] for i, k in enumerate(keys)}, uncertainty
+        # 可解释表示投影
+        self.explain_proj = nn.Sequential(
+            nn.Linear(bottleneck_dim, d_model),
+            nn.LayerNorm(d_model), nn.SiLU(), nn.Dropout(dropout_rate),
+            nn.Linear(d_model, d_model),
+        )
+
+        # 重建解码器
+        self.decoder = nn.Sequential(
+            nn.Linear(bottleneck_dim, d_model),
+            nn.LayerNorm(d_model), nn.SiLU(),
+            nn.Linear(d_model, d_model),
+        )
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, z_seq: Tensor, proto_weights: Tensor, proto_res: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        # proto_res: [B, K, D]（旋转后的原型矩阵）
+        B = z_seq.size(0)
+        # 池化原型矩阵为 [B, D]
+        proto_pooled = torch.einsum('bk,bkd->bd', proto_weights, proto_res)
+        x = torch.cat([z_seq, proto_pooled, proto_weights], dim=-1)
+
+        h = self.encoder(x)
+        mu, logvar = h.chunk(2, dim=-1)
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
+        std = torch.exp(0.5 * logvar)
+
+        eps = torch.randn_like(std)
+        z = mu + std * eps if self.training else mu
+
+        # IB loss: KL(q(z|x) || N(0,1))
+        ib_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1).mean()
+        ib_loss = torch.clamp(ib_loss, max=20.0)
+
+        diff_explain = self.explain_proj(z)
+        recon = self.decoder(z)
+        recon_loss = F.mse_loss(recon, z_seq.detach(), reduction='mean')
+
+        with torch.no_grad():
+            err = F.mse_loss(recon, z_seq, reduction='none').mean(dim=-1)
+            sig = (z_seq ** 2).mean(dim=-1).clamp(min=1e-8)
+            diff_quality = torch.exp(-err / sig * 5)
+
+        return diff_explain, diff_quality, ib_loss, recon_loss
 
 
 # ==============================================================================
-# v9.0: CrossFieldNet (preserved)
+# v10: EnergyCalibrator（能量校准器，eval 时校准 CTR）
+# ==============================================================================
+
+class EnergyCalibrator(nn.Module):
+    def __init__(self, d_model: int, num_codes: int, dropout_rate: float = 0.15):
+        super().__init__()
+        self.energy_net = nn.Sequential(
+            nn.Linear(num_codes + d_model * 2, d_model),
+            nn.LayerNorm(d_model), nn.SiLU(), nn.Dropout(dropout_rate),
+            nn.Linear(d_model, d_model // 2), nn.SiLU(),
+            nn.Linear(d_model // 2, 1),
+            nn.Softplus(),
+        )
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, proto_weights: Tensor, user_feat: Tensor, item_feat: Tensor) -> Tensor:
+        x = torch.cat([proto_weights, user_feat, item_feat], dim=-1)
+        energy = self.energy_net(x).squeeze(-1)
+        return torch.clamp(energy, min=0.0, max=10.0)
+
+    def compute_ranking_loss(self, energy: Tensor, labels: Tensor, margin: float = 1.0) -> Tensor:
+        """自监督对比排序：正样本能量应低于负样本"""
+        pos_mask = labels > 0.5
+        neg_mask = ~pos_mask
+        pos_idx = torch.where(pos_mask)[0]
+        neg_idx = torch.where(neg_mask)[0]
+        n_pos = pos_idx.numel()
+        n_neg = neg_idx.numel()
+        if n_pos == 0 or n_neg == 0:
+            return torch.tensor(0.0, device=energy.device)
+        n_sample = min(5, n_neg)
+        if n_neg > n_sample:
+            neg_sample_idx = neg_idx[torch.randperm(n_neg, device=energy.device)[:n_sample]]
+        else:
+            neg_sample_idx = neg_idx
+        pos_e = energy[pos_idx]
+        neg_e = energy[neg_sample_idx]
+        diff = pos_e.unsqueeze(1) - neg_e.unsqueeze(0) + margin
+        return F.relu(diff).mean()
+
+
+# ==============================================================================
+# v10: ProtoConditionedCrossFieldNet（特征交互层核心）
 # ==============================================================================
 
 class SeqFiLM(nn.Module):
@@ -697,277 +769,150 @@ class SeqFiLM(nn.Module):
         return x * gamma + beta
 
 
-class CrossFieldLayer(nn.Module):
-    def __init__(self, d_model: int, num_heads: int = 4, ffn_ratio: float = 2.0):
+class ProtoConditionedCrossFieldLayer(nn.Module):
+    def __init__(self, d_model: int, num_heads: int = 4, ffn_ratio: float = 2.0,
+                 dropout_rate: float = 0.15, num_codes: int = 128):
         super().__init__()
         self.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
         self.attn_norm = nn.LayerNorm(d_model)
+        # proto_weights → 场注意力偏置
+        self.proto_bias_proj = nn.Linear(num_codes, d_model)
         self.film = SeqFiLM(d_model)
         hidden = int(d_model * ffn_ratio)
         self.ffn = nn.Sequential(nn.Linear(d_model, hidden), nn.SiLU(), nn.Linear(hidden, d_model))
         self.ffn_norm = nn.LayerNorm(d_model)
-        nn.init.xavier_uniform_(self.ffn[0].weight, gain=0.1)
-        nn.init.xavier_uniform_(self.ffn[2].weight, gain=0.1)
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
+        # diff_explain → 场门控（可选）
+        self.diff_gate = nn.Sequential(nn.Linear(d_model, d_model), nn.Sigmoid())
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
-    def forward(self, x: Tensor, seq_cond: Tensor) -> Tensor:
+    def forward(self, x: Tensor, seq_cond: Tensor,
+                proto_weights: Optional[Tensor] = None,
+                diff_explain: Optional[Tensor] = None) -> Tensor:
         attn_out, _ = self.attn(x, x, x)
+        if proto_weights is not None:
+            # 温和场偏置：避免主导原始注意力
+            proto_bias = self.proto_bias_proj(proto_weights).unsqueeze(1)  # [B, 1, D]
+            attn_out = attn_out + 0.05 * proto_bias
         x = self.attn_norm(x + attn_out)
+        x = self.dropout(x)
         x = self.film(x, seq_cond)
-        x = self.ffn_norm(x + self.ffn(x))
+        ffn_out = self.ffn(x)
+        if diff_explain is not None:
+            gate = self.diff_gate(diff_explain).unsqueeze(1)  # [B, 1, D]
+            ffn_out = ffn_out * gate
+        x = self.ffn_norm(x + ffn_out)
+        x = self.dropout(x)
         return x
 
 
-class CrossFieldNet(nn.Module):
+class ProtoConditionedCrossFieldNet(nn.Module):
     def __init__(self, fields: List[str], d_model: int = 128, num_layers: int = 4,
-                 num_heads: int = 4, ffn_ratio: float = 2.0):
+                 num_heads: int = 4, num_codes: int = 128, ffn_ratio: float = 2.0,
+                 dropout_rate: float = 0.0):
         super().__init__()
         self.fields = fields
         self.num_fields = len(fields)
         self.d_model = d_model
-        self.layers = nn.ModuleList([CrossFieldLayer(d_model, num_heads, ffn_ratio) for _ in range(num_layers)])
+        self.layers = nn.ModuleList([
+            ProtoConditionedCrossFieldLayer(d_model, num_heads, ffn_ratio, dropout_rate, num_codes)
+            for _ in range(num_layers)
+        ])
         self.field_emb = nn.Parameter(torch.randn(self.num_fields, d_model) * 0.02)
 
-    def forward(self, fields: Dict[str, Tensor], seq_cond: Tensor) -> Dict[str, Tensor]:
-        x = torch.stack([fields[f] for f in self.fields], dim=1)
+    def forward(self, fields: Dict[str, Tensor], seq_cond: Tensor,
+                proto_weights: Optional[Tensor] = None,
+                diff_explain: Optional[Tensor] = None) -> Dict[str, Tensor]:
+        x = torch.stack([fields[f] for f in self.fields], dim=1)  # [B, F, D]
         x = x + self.field_emb.unsqueeze(0)
         for layer in self.layers:
-            x = layer(x, seq_cond)
+            x = layer(x, seq_cond, proto_weights=proto_weights, diff_explain=diff_explain)
         return {f: x[:, i] for i, f in enumerate(self.fields)}
 
 
 # ==============================================================================
-# v9.3: Isolated Task Heads — 新增生成表示路径
+# v10: CalibratedCTRHead（预测层）
 # ==============================================================================
 
-class CTRHead(nn.Module):
-    def __init__(self, d_model: int, num_codes: int):
+class CalibratedCTRHead(nn.Module):
+    def __init__(self, d_model: int, num_codes: int, dropout_rate: float = 0.15):
         super().__init__()
-        self.static_proj = nn.Sequential(nn.Linear(d_model * 4, d_model), nn.LayerNorm(d_model))
-        self.proto_proj = nn.Sequential(nn.Linear(d_model, d_model), nn.LayerNorm(d_model))
-        self.gate = nn.Sequential(nn.Linear(d_model * 2 + num_codes, 2), nn.Softmax(dim=-1))
+        self.static_proj = nn.Sequential(
+            nn.Linear(d_model * 4, d_model), nn.LayerNorm(d_model)
+        )
+        self.proto_proj = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.LayerNorm(d_model)
+        )
+        # 双尺度门控：static / proto
+        self.gate = nn.Sequential(
+            nn.Linear(d_model * 2 + num_codes, d_model),
+            nn.LayerNorm(d_model), nn.SiLU(),
+            nn.Linear(d_model, 2), nn.Softmax(dim=-1),
+        )
+        # 正样本残差聚焦
+        self.pos_residual = nn.Sequential(
+            nn.Linear(d_model, d_model // 2), nn.SiLU(), nn.Linear(d_model // 2, d_model)
+        )
         self.output = nn.Linear(d_model, 1, bias=True)
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
+        # CVR ≈ 5% 先验 log-odds ≈ -2.94，给模型合理起点
+        nn.init.constant_(self.output.bias, -2.0)
         nn.init.xavier_uniform_(self.output.weight, gain=0.1)
-        nn.init.zeros_(self.output.bias)
 
-    def forward(self, final_repr, proto_repr, proto_weights, user_feat, item_feat):
+    def forward(self, final_repr: Tensor, proto_repr: Tensor, proto_weights: Tensor,
+                user_feat: Tensor, item_feat: Tensor, energy_score: Optional[Tensor] = None) -> Tensor:
         static = self.static_proj(final_repr)
         proto = self.proto_proj(proto_repr)
+        # 正样本模式注入：防止全员预测负类躺平
+        proto_activations = proto_weights.max(dim=-1, keepdim=True)[0]
+        pos_boost = torch.sigmoid(proto_activations - 0.5) * self.pos_residual(proto)
         context = torch.cat([user_feat, item_feat], dim=-1)
         gate_input = torch.cat([context, proto_weights], dim=-1)
-        g = self.gate(gate_input)
-        fused = g[:, 0:1] * static + g[:, 1:2] * proto
-        return self.output(fused)
-
-
-class DiffusionHead(nn.Module):
-    def __init__(self, d_model: int, num_codes: int, num_steps: int = 5):
-        super().__init__()
-        self.num_steps = num_steps
-        self.noise_pred = nn.Sequential(
-            nn.Linear(d_model * 4 + 1, d_model * 2), nn.SiLU(), nn.Linear(d_model * 2, d_model))
-        # 【v9.3】生成表示投影：将去噪后的原型映射到语义空间
-        self.gen_proj = nn.Sequential(
-            nn.Linear(d_model * 2, d_model), nn.LayerNorm(d_model), nn.SiLU(), nn.Linear(d_model, d_model)
-        )
-        betas = torch.linspace(1e-4, 0.02, num_steps)
-        self.register_buffer('betas', betas)
-        alphas = 1.0 - betas
-        self.register_buffer('alphas', alphas)
-        self.register_buffer('alpha_bars', torch.cumprod(alphas, dim=0))
-        nn.init.xavier_uniform_(self.noise_pred[0].weight, gain=0.1)
-        nn.init.xavier_uniform_(self.noise_pred[2].weight, gain=0.1)
-        nn.init.xavier_uniform_(self.gen_proj[0].weight, gain=0.1)
-        nn.init.xavier_uniform_(self.gen_proj[3].weight, gain=0.1)
-
-    def get_gen_repr(
-        self,
-        proto_repr: Tensor,
-        user_feat: Tensor,
-        item_feat: Tensor,
-        context_feat: Tensor,
-        deterministic: bool = False,
-    ) -> Tuple[Tensor, Tensor]:
-        """
-        返回: (gen_repr, diff_residual)
-        deterministic=True 时用于 eval，固定 t 和 zero noise
-        """
-        B, D = proto_repr.shape
-        device = proto_repr.device
-
-        if deterministic:
-            t = torch.full((B,), self.num_steps // 2, device=device, dtype=torch.long)
-            noise = torch.zeros_like(proto_repr)
-        else:
-            t = torch.randint(0, self.num_steps, (B,), device=device)
-            noise = torch.randn_like(proto_repr)
-
-        alpha_bar_t = self.alpha_bars[t].view(B, 1)
-        noisy_proto = torch.sqrt(alpha_bar_t) * proto_repr + torch.sqrt(1 - alpha_bar_t) * noise
-
-        cond = torch.cat([user_feat, item_feat, context_feat, noisy_proto], dim=-1)
-        t_emb = (t.float() / self.num_steps).view(B, 1)
-
-        with torch.no_grad():
-            pred_noise = self.noise_pred(torch.cat([cond, t_emb], dim=-1))
-
-        # 扩散残差作为 uncertainty 信号
-        diff_residual = F.mse_loss(pred_noise, noise).detach()
-
-        denoised = (noisy_proto - torch.sqrt(1 - alpha_bar_t) * pred_noise.detach()) / torch.sqrt(alpha_bar_t)
-        denoised = torch.clamp(denoised, min=-10.0, max=10.0)
-        gen_repr = self.gen_proj(torch.cat([denoised, proto_repr], dim=-1))
-
-        return F.normalize(gen_repr, p=2, dim=-1) * math.sqrt(D), diff_residual
-
-    def forward(self, proto_repr, user_feat, item_feat, context_feat):
-        """原始扩散路径（用于独立loss计算，输入由caller detach）"""
-        B, D = proto_repr.shape
-        device = proto_repr.device
-        t = torch.randint(0, self.num_steps, (B,), device=device)
-        alpha_bar_t = self.alpha_bars[t].view(B, 1)
-        noise = torch.randn_like(proto_repr)
-        noisy_proto = torch.sqrt(alpha_bar_t) * proto_repr + torch.sqrt(1 - alpha_bar_t) * noise
-        cond = torch.cat([user_feat, item_feat, context_feat, noisy_proto], dim=-1)
-        t_emb = (t.float() / self.num_steps).view(B, 1)
-        pred_noise = self.noise_pred(torch.cat([cond, t_emb], dim=-1))
-        return pred_noise, noise, t
-
-
-class EnergyHead(nn.Module):
-    def __init__(self, d_model: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_model * 3, 256), nn.LayerNorm(256), nn.SiLU(), nn.Linear(256, 1))
-        # 【v9.3】生成表示投影
-        self.gen_proj = nn.Sequential(
-            nn.Linear(d_model * 3, d_model), nn.LayerNorm(d_model), nn.SiLU(), nn.Linear(d_model, d_model)
-        )
-        nn.init.xavier_uniform_(self.net[0].weight, gain=0.1)
-        nn.init.xavier_uniform_(self.net[3].weight, gain=0.1)
-        nn.init.xavier_uniform_(self.gen_proj[0].weight, gain=0.1)
-        nn.init.xavier_uniform_(self.gen_proj[3].weight, gain=0.1)
-
-    def get_gen_repr(self, proto_repr, user_feat, item_feat):
-        """【v9.3】能量生成表示：基于能量函数学习判别性表示，梯度流向共享层"""
-        joint = torch.cat([proto_repr, user_feat, item_feat], dim=-1)
-        gen_repr = self.gen_proj(joint)
-        return F.normalize(gen_repr, p=2, dim=-1) * math.sqrt(proto_repr.size(-1))
-
-    def forward(self, proto_repr, user_feat, item_feat):
-        joint = torch.cat([proto_repr, user_feat, item_feat], dim=-1)
-        energy = self.net(joint).squeeze(-1)
-        return energy
+        g = self.gate(gate_input)  # [B, 2]
+        fused = g[:, 0:1] * static + g[:, 1:2] * (proto + pos_boost)
+        fused = self.dropout(fused)
+        logits = self.output(fused)
+        # eval 时 energy_score 校准：高不确定性降低 logit
+        if energy_score is not None and not self.training:
+            with torch.no_grad():
+                cal = -0.1 * (energy_score - energy_score.mean()).unsqueeze(-1)
+                logits = logits + cal
+        # 动态偏置校正：防止 logits 无限下钻
+        if self.training:
+            with torch.no_grad():
+                lm = logits.mean()
+                if lm < -3.0:
+                    self.output.bias.data += 0.01 * (-3.0 - lm)
+        return logits
 
 
 # ==============================================================================
-# v9.3: GenerativeFusion — 新增模块
-# ==============================================================================
-
-class GenerativeFusion(nn.Module):
-    """
-    【v9.3】生成式表示融合模块：借鉴HSTU/TIGER范式，
-    将扩散去噪表示、能量判别表示与原型表示通过门控融合，
-    输出语义更丰富的联合表示供CTR预测使用。
-    v9.3-RS: 残差融合，eval/train 行为一致，仅随机性不同
-    """
-
-    def __init__(self, d_model: int):
-        super().__init__()
-        self.d_model = d_model
-        self.fusion_gate = nn.Sequential(
-            nn.Linear(d_model * 3, d_model),
-            nn.LayerNorm(d_model),
-            nn.SiLU(),
-            nn.Linear(d_model, 3),
-            nn.Softmax(dim=-1),
-        )
-        self.residual_proj = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.LayerNorm(d_model),
-        )
-        for m in self.fusion_gate.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-        for m in self.residual_proj.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(
-        self,
-        proto_repr: Tensor,
-        diff_repr: Tensor,
-        energy_repr: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
-        delta_diff = diff_repr - proto_repr
-        delta_energy = energy_repr - proto_repr
-        gate_input = torch.cat([proto_repr, diff_repr, energy_repr], dim=-1)
-        gates = self.fusion_gate(gate_input)
-
-        # 残差形式：eval 回退到 proto 时损失可控
-        fused = proto_repr + gates[:, 1:2] * delta_diff + gates[:, 2:3] * delta_energy
-        out = self.residual_proj(fused)
-        return out, gates
-
-
-# ==============================================================================
-# v9.0: FokkerPlanckRegularizer (preserved)
-# ==============================================================================
-
-class FokkerPlanckRegularizer(nn.Module):
-    def __init__(self, d_model: int):
-        super().__init__()
-        self.drift_mlp = nn.Sequential(nn.Linear(d_model * 2, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
-        self.log_diffusion = nn.Parameter(torch.zeros(d_model))
-
-    def forward(self, z_t, z_t_next, delta_t=1.0):
-        z_mean = z_t.mean(dim=0, keepdim=True)
-        z_std = z_t.std(dim=0, keepdim=True).clamp(min=1e-8)
-        score = (z_mean - z_t) / (z_std ** 2)
-        drift_input = torch.cat([z_t, score], dim=-1)
-        f_z = self.drift_mlp(drift_input)
-        D_z = torch.exp(self.log_diffusion).unsqueeze(0)
-        dz_dt = (z_t_next - z_t) / delta_t
-        residual = dz_dt - f_z - 0.5 * D_z * score
-        loss_fp = torch.mean((residual ** 2) / (D_z + 1e-8)) + torch.mean(torch.log(D_z + 1e-8))
-        return loss_fp
-
-
-# ==============================================================================
-# v9.3: MetaAligner — 过拟合感知动态调度
+# v10: MetaAligner（过拟合感知，仅输出 aux_weight）
 # ==============================================================================
 
 class MetaAligner(nn.Module):
-    """
-    MetaAligner v2: 协同自适应正则化控制器
-    核心改进：
-    1. 单一 aux_weight 信源，无 alpha/diff/energy 分离
-    2. 泄漏积分器：历史自动衰减，无债务累积
-    3. Valid 间插值：无 valid 时向保守值回归，而非 health 放飞
-    4. 自适应 EMA：根据 gap 变化率调整平滑度
-    5. 辅助任务只输出 loss 权重，不输出表示（物理隔离）
-    """
-
     def __init__(
         self,
         num_codes: int = 128,
         warmup_steps: int = 300,
         probe_burn_in: int = 200,
         kp: float = 2.0,
-        ki: float = 0.05,      # 降低，配合泄漏积分器
+        ki: float = 0.02,
         kd: float = 1.0,
-        max_aux_weight: float = 0.3,   # 从 0.5 降到 0.3
-        leak_rate: float = 0.01,       # 积分器泄漏率
-        valid_decay_rate: float = 0.995,  # Valid 间 aux_weight 衰减
-        ema_fast: float = 0.8,         # gap 变化快时用
-        ema_slow: float = 0.95,        # gap 稳定时用
+        max_aux_weight: float = 0.15,
+        leak_rate: float = 0.03,
+        valid_decay_rate: float = 0.98,
+        ema_fast: float = 0.7,
+        ema_slow: float = 0.95,
+        integral_clip: float = 2.0,
     ):
         super().__init__()
-        self.dummy = nn.Parameter(torch.zeros(1))  # 保持 nn.Module 身份
-        
+        self.dummy = nn.Parameter(torch.zeros(1))
+
         self.warmup_steps = warmup_steps
         self.probe_burn_in = probe_burn_in
         self.max_aux_weight = max_aux_weight
@@ -975,54 +920,36 @@ class MetaAligner(nn.Module):
         self.valid_decay_rate = valid_decay_rate
         self.ema_fast = ema_fast
         self.ema_slow = ema_slow
-        
+        self.integral_clip = integral_clip
+
         self.kp, self.ki, self.kd = kp, ki, kd
-        
-        # 泄漏积分器：带自动衰减
+
         self.register_buffer('integral', torch.tensor(0.0))
-        self.register_buffer('integral_momentum', torch.tensor(0.0))  # 二阶矩，检测变化
-        
-        # Valid 间状态缓存
         self.register_buffer('last_valid_gap', torch.tensor(0.0))
-        self.register_buffer('last_valid_aux', torch.tensor(0.0))
         self.register_buffer('steps_since_valid', torch.tensor(0))
-        
-        # EMA 状态
         self.register_buffer('ema_aux', torch.tensor(0.0))
-        self.register_buffer('ema_gap', torch.tensor(0.0))
-        
-        # 历史（仅用于诊断，不参与计算）
+
         self.gap_history = deque(maxlen=10)
         self.aux_history = deque(maxlen=10)
 
     def _leaky_integrate(self, gap: float) -> float:
-        """
-        泄漏积分：每一步自动衰减，防止历史债务
-        integral_t = (1 - leak) * integral_{t-1} + gap_t
-        """
         self.integral = (1 - self.leak_rate) * self.integral + gap
-        # 软裁剪，非硬边界
-        self.integral = self.integral * torch.sigmoid(self.integral)  # 自限幅
+        self.integral = torch.clamp(
+            self.integral,
+            min=-self.integral_clip,
+            max=self.integral_clip
+        )
         return self.integral.item()
 
     def _adaptive_ema(self, new_val: float, old_ema: float) -> float:
-        """
-        自适应 EMA：根据变化速度选择快/慢衰减
-        """
         delta = abs(new_val - old_ema)
-        # 变化大时用 fast（快速响应），变化小时用 slow（稳定）
         ema_decay = self.ema_fast if delta > 0.1 else self.ema_slow
         return ema_decay * old_ema + (1 - ema_decay) * new_val
 
     def _interpolate_without_valid(self, base_aux: float) -> float:
-        """
-        Valid 间插值：向保守值回归，而非 health 放飞
-        """
         steps = int(self.steps_since_valid.item())
-        # 无 valid 越久，aux_weight 越向 0 衰减（保守策略）
         decay = self.valid_decay_rate ** steps
-        # 基础值与保守值的插值
-        conservative = 0.05  # 最低辅助权重
+        conservative = 0.05
         return conservative + (base_aux - conservative) * decay
 
     def forward(
@@ -1032,9 +959,11 @@ class MetaAligner(nn.Module):
         valid_auc: Optional[float] = None,
         train_auc: Optional[float] = None,
         global_step: int = 0,
+        ctr_loss: Optional[float] = None,
+        uncertainty_mean: Optional[float] = None,
+        diff_quality: Optional[float] = None,
     ) -> Dict[str, Any]:
-        
-        # === Phase 1: 计算当前 gap ===
+        # 计算当前 gap
         gap = 0.0
         if train_auc is not None and valid_auc is not None and valid_auc > 0:
             gap = max(0.0, train_auc - valid_auc)
@@ -1043,58 +972,58 @@ class MetaAligner(nn.Module):
             self.steps_since_valid = torch.tensor(0)
         else:
             self.steps_since_valid += 1
-            # 无 valid 时，用上次 valid 的 gap 估计（保守假设 gap 不变或微增）
-            gap = float(self.last_valid_gap.item()) * 1.01  # 微增假设
-        
-        # === Phase 2: PID 控制（泄漏积分器） ===
-        integral = self._leaky_integrate(gap)
-        
-        # 变化率（导数）
+            gap = float(self.last_valid_gap.item()) * 1.01
+
+        # CTR loss 趋势信号
+        ctr_trend = 0.0
+        if ctr_loss is not None:
+            if not hasattr(self, '_ctr_loss_history'):
+                self._ctr_loss_history = deque(maxlen=5)
+            if len(self._ctr_loss_history) > 0:
+                last_ctr = self._ctr_loss_history[-1]
+                ctr_trend = max(0.0, (ctr_loss - last_ctr) / max(abs(last_ctr), 1e-8))
+            self._ctr_loss_history.append(ctr_loss)
+
+        # 不确定性信号
+        uncertainty_signal = 0.0
+        if uncertainty_mean is not None:
+            uncertainty_signal = max(0.0, uncertainty_mean - 1.0)
+
+        # PID 控制
+        integral = self._leaky_integrate(gap + 0.5 * ctr_trend + 0.3 * uncertainty_signal)
         gap_trend = 0.0
         if len(self.gap_history) >= 2:
             gap_trend = (self.gap_history[-1] - self.gap_history[0]) / len(self.gap_history)
-        
+
         P = self.kp * gap
         I = self.ki * integral
         D = self.kd * (-gap_trend)
-        
         raw_aux = max(0.0, P + I + D)
-        
-        # === Phase 3: Valid 间插值 ===
+
+        # Valid 间插值
         if valid_auc is None or valid_auc <= 0:
             raw_aux = self._interpolate_without_valid(raw_aux)
-        
-        # === Phase 4: 自适应 EMA 平滑 ===
+
+        # 自适应 EMA
         new_ema = self._adaptive_ema(raw_aux, float(self.ema_aux.item()))
         self.ema_aux = torch.tensor(new_ema)
-        
-        # 最终 aux_weight：EMA 后硬上限
         aux_weight = min(self.max_aux_weight, new_ema)
-        
-        # === Phase 5: 辅助任务分配（单一信源） ===
-        # 不再维护独立的 alpha['diff'] / alpha['energy']
-        # 直接返回 aux_weight，由调用方按比例分配
-        diff_ratio = 0.6  # 固定比例，或基于 probe 动态调整
-        energy_ratio = 0.4
-        
+
         result = {
             'aux_weight': aux_weight,
-            'diff_weight': aux_weight * diff_ratio,
-            'energy_weight': aux_weight * energy_ratio,
-            'ctr_weight': 1.0 - aux_weight,
+            'ctr_weight': 1.0,
             'gap': gap,
             'integral': integral,
             'mode': 'valid_pid' if (valid_auc and valid_auc > 0) else 'interpolated',
             'ema_aux': new_ema,
             'steps_since_valid': int(self.steps_since_valid.item()),
         }
-        
         self.aux_history.append(aux_weight)
         return result
 
 
 # ==============================================================================
-# v9.3: PCVRHeteroFormer (main model)
+# v10: PCVRHeteroFormer (main model)
 # ==============================================================================
 
 class PCVRHeteroFormer(nn.Module):
@@ -1142,14 +1071,11 @@ class PCVRHeteroFormer(nn.Module):
         kappa_base: float = 2.0,
         kappa_min: float = 0.5,
         lie_rank: int = 8,
-        use_domain_adversarial: bool = False,
-        use_generative_fusion: bool = True,  # 【v9.3】新增
+        **kwargs,  # 吸收旧版兼容参数（use_diffusion / use_energy 等）
     ):
         super().__init__()
         self.d_model = d_model
         self.num_codes = num_codes
-        self.use_domain_adversarial = use_domain_adversarial
-        self.use_generative_fusion = use_generative_fusion
 
         self.encoder = MultiViewEncoder(
             user_int_feature_specs=user_int_feature_specs,
@@ -1160,6 +1086,7 @@ class PCVRHeteroFormer(nn.Module):
             emb_dim=emb_dim,
             id_vocab_threshold=id_vocab_threshold,
             emb_skip_threshold=emb_skip_threshold,
+            dropout_rate=dropout,
         )
 
         self.seq_domains = sorted(seq_vocab_sizes.keys())
@@ -1168,12 +1095,12 @@ class PCVRHeteroFormer(nn.Module):
             self.seq_encoders[domain] = ContinuousSequenceEncoder(
                 vocab_sizes=vocab_sizes, d_model=d_model, state_dim=max(64, d_model // 2),
                 num_layers=2, max_seq_len=512, id_threshold=seq_id_threshold,
+                dropout_rate=dropout,
             )
 
-        # 【手术1】多序列融合模块
         self.num_seq_domains = len(self.seq_domains)
         if self.num_seq_domains > 1:
-            self.seq_fusion_short = MultiSeqFusion(d_model, self.num_seq_domains, num_heads=4)                             
+            self.seq_fusion_short = MultiSeqFusion(d_model, self.num_seq_domains, num_heads=4)
             self.seq_fusion_long = MultiSeqFusion(d_model, self.num_seq_domains, num_heads=4)
             self.seq_fusion_static = MultiSeqFusion(d_model, self.num_seq_domains, num_heads=4)
         else:
@@ -1189,39 +1116,34 @@ class PCVRHeteroFormer(nn.Module):
             lie_rank=lie_rank,
         )
 
+        # v10: 生成式语义层
+        self.diffusion_explainer = DiffusionExplainer(d_model, num_codes, dropout_rate=dropout)
+        self.energy_calibrator = EnergyCalibrator(d_model, num_codes, dropout_rate=dropout)
+
+        # v10: 特征交互层
         self.explicit_cross = BilinearCrossLayer(d_model, num_fields=4, cross_ratio=0.1)
-        self.cross_field = CrossFieldNet(
+        self.cross_field = ProtoConditionedCrossFieldNet(
             fields=['user', 'item', 'context', 'seq'],
             d_model=d_model, num_layers=num_layers,
-            num_heads=num_heads or max(4, d_model // 32), ffn_ratio=2.0,
+            num_heads=num_heads or max(4, d_model // 32), num_codes=num_codes,
+            ffn_ratio=2.0, dropout_rate=dropout,
         )
 
-        self.ctr_head = CTRHead(d_model, num_codes)
-        self.diff_head = DiffusionHead(d_model, num_codes)
-        self.energy_head = EnergyHead(d_model)
-        self.fp_regularizer = FokkerPlanckRegularizer(d_model)
-
-        # 【v9.3】生成式表示融合
-        if use_generative_fusion:
-            self.gen_fusion = GenerativeFusion(d_model)
-        else:
-            self.gen_fusion = None
-
-        if use_domain_adversarial:
-            self.domain_disc = nn.Sequential(nn.Linear(d_model, 256), nn.SiLU(), nn.Linear(256, 1))
+        # v10: 预测层
+        self.ctr_head = CalibratedCTRHead(d_model, num_codes, dropout_rate=dropout)
 
         self.meta_aligner = MetaAligner(
             num_codes=num_codes,
             warmup_steps=300,
             probe_burn_in=200,
             kp=2.0,
-            ki=0.05,              # V2 降低
+            ki=0.05,
             kd=1.0,
-            max_aux_weight=0.3,     # V2 从 0.5 降到 0.3
-            leak_rate=0.01,        # V2 新增
-            valid_decay_rate=0.995,  # V2 新增
-            ema_fast=0.8,          # V2 新增
-            ema_slow=0.95,         # V2 新增
+            max_aux_weight=0.3,
+            leak_rate=0.01,
+            valid_decay_rate=0.995,
+            ema_fast=0.8,
+            ema_slow=0.95,
         )
         self.logit_temperature = nn.Parameter(torch.tensor(0.0))
         self.logit_bias = nn.Parameter(torch.tensor(0.0))
@@ -1230,22 +1152,15 @@ class PCVRHeteroFormer(nn.Module):
         self._register_param_groups()
 
     def _register_param_groups(self):
-        """【v9.3】参数分组，新增gen_fusion归入ctr_head_params"""
+        """v10 参数分组：shared(CTR路径) / gen(生成模块自监督) / sparse / meta"""
         self._sparse_params = []
         self._shared_encoder_params = []
         self._seq_encoder_params = []
         self._proto_geo_params = []
-        self._proto_cond_params = []
         self._cross_field_params = []
         self._ctr_head_params = []
-        self._diff_head_params = []
-        self._energy_head_params = []
-        self._task_proj_ctr_params = []
-        self._task_proj_diff_params = []
-        self._task_proj_energy_params = []
-        self._fp_params = []
+        self._gen_module_params = []   # diffusion_explainer + energy_calibrator
         self._meta_params = []
-        self._disc_params = []
 
         for name, p in self.named_parameters():
             if not p.requires_grad:
@@ -1255,33 +1170,21 @@ class PCVRHeteroFormer(nn.Module):
                 self._sparse_params.append(p)
             elif 'seq_encoders' in name:
                 self._seq_encoder_params.append(p)
-            elif any(x in name for x in ['prototype.eta', 'prototype.rotation', 
-                                           'prototype.kappa_log', 'prototype.kappa_time_decay']):
+            elif any(x in name for x in ['prototype.eta', 'prototype.rotation',
+                                           'prototype.kappa_log', 'prototype.kappa_time_decay',
+                                           'prototype.empty_prior', 'prototype.U', 'prototype.V',
+                                           'prototype.kappa_user_proj']):
                 self._proto_geo_params.append(p)
-            elif 'prototype.task_proj.ctr' in name:
-                self._task_proj_ctr_params.append(p)
-            elif 'prototype.task_proj.diff' in name:
-                self._task_proj_diff_params.append(p)
-            elif 'prototype.task_proj.energy' in name:
-                self._task_proj_energy_params.append(p)
             elif 'prototype' in name:
-                self._proto_cond_params.append(p)
-            elif 'cross_field' in name:
+                self._proto_geo_params.append(p)
+            elif 'diffusion_explainer' in name or 'energy_calibrator' in name:
+                self._gen_module_params.append(p)
+            elif 'cross_field' in name or 'explicit_cross' in name:
                 self._cross_field_params.append(p)
             elif 'ctr_head' in name:
                 self._ctr_head_params.append(p)
-            elif 'diff_head' in name:
-                self._diff_head_params.append(p)
-            elif 'energy_head' in name:
-                self._energy_head_params.append(p)
-            elif 'gen_fusion' in name:
-                self._ctr_head_params.append(p)
-            elif 'fp_regularizer' in name:
-                self._fp_params.append(p)
             elif 'meta_aligner' in name:
                 self._meta_params.append(p)
-            elif 'domain_disc' in name:
-                self._disc_params.append(p)
             elif 'logit_temperature' in name or 'logit_bias' in name:
                 self._ctr_head_params.append(p)
             elif 'encoder' in name:
@@ -1289,14 +1192,13 @@ class PCVRHeteroFormer(nn.Module):
             else:
                 self._shared_encoder_params.append(p)
 
+        # 生成模块统一包含所有 prototype 几何参数
+        self._gen_module_params.extend(self._proto_geo_params)
+
         all_assigned = (
-            self._sparse_params + self._shared_encoder_params + 
-            self._seq_encoder_params + self._proto_geo_params +
-            self._proto_cond_params + self._cross_field_params +
-            self._ctr_head_params + self._diff_head_params +
-            self._energy_head_params + self._task_proj_ctr_params +
-            self._task_proj_diff_params + self._task_proj_energy_params +
-            self._fp_params + self._meta_params + self._disc_params
+            self._sparse_params + self._shared_encoder_params +
+            self._seq_encoder_params + self._cross_field_params +
+            self._ctr_head_params + self._gen_module_params + self._meta_params
         )
         total_params = sum(1 for _ in self.parameters() if _.requires_grad)
         assigned_count = len(all_assigned)
@@ -1304,16 +1206,16 @@ class PCVRHeteroFormer(nn.Module):
         if assigned_count != total_params:
             logging.warning(f"【参数分组警告】{assigned_count}/{total_params} 参数被分配，存在遗漏！")
         else:
-            logging.info(f"【参数分组v9.3】所有{total_params}个参数已正确分配")
+            logging.info(f"【参数分组v10】所有{total_params}个参数已正确分配")
 
         group_counts = {
-            'sparse': len(self._sparse_params), 'shared_encoder': len(self._shared_encoder_params),
-            'seq_encoder': len(self._seq_encoder_params), 'proto_geo': len(self._proto_geo_params),
-            'proto_cond': len(self._proto_cond_params), 'cross_field': len(self._cross_field_params),
-            'ctr_head': len(self._ctr_head_params), 'diff_head': len(self._diff_head_params),
-            'energy_head': len(self._energy_head_params), 'task_proj_ctr': len(self._task_proj_ctr_params),
-            'task_proj_diff': len(self._task_proj_diff_params), 'task_proj_energy': len(self._task_proj_energy_params),
-            'fp': len(self._fp_params), 'meta': len(self._meta_params), 'disc': len(self._disc_params),
+            'sparse': len(self._sparse_params),
+            'shared_encoder': len(self._shared_encoder_params),
+            'seq_encoder': len(self._seq_encoder_params),
+            'cross_field': len(self._cross_field_params),
+            'ctr_head': len(self._ctr_head_params),
+            'gen_module': len(self._gen_module_params),
+            'meta': len(self._meta_params),
         }
         for gname, gcount in group_counts.items():
             if gcount > 0:
@@ -1321,13 +1223,13 @@ class PCVRHeteroFormer(nn.Module):
 
     def get_param_groups(self) -> Dict[str, List[nn.Parameter]]:
         return {
-            'sparse': self._sparse_params, 'shared_encoder': self._shared_encoder_params,
-            'seq_encoder': self._seq_encoder_params, 'proto_geo': self._proto_geo_params,
-            'proto_cond': self._proto_cond_params, 'cross_field': self._cross_field_params,
-            'ctr_head': self._ctr_head_params, 'diff_head': self._diff_head_params,
-            'energy_head': self._energy_head_params, 'task_proj_ctr': self._task_proj_ctr_params,
-            'task_proj_diff': self._task_proj_diff_params, 'task_proj_energy': self._task_proj_energy_params,
-            'fp': self._fp_params, 'meta': self._meta_params, 'disc': self._disc_params,
+            'sparse': self._sparse_params,
+            'shared_encoder': self._shared_encoder_params,
+            'seq_encoder': self._seq_encoder_params,
+            'cross_field': self._cross_field_params,
+            'ctr_head': self._ctr_head_params,
+            'gen_module': self._gen_module_params,
+            'meta': self._meta_params,
         }
 
     def forward(self, model_input: ModelInput, task_id: str = 'ctr'):
@@ -1361,84 +1263,71 @@ class PCVRHeteroFormer(nn.Module):
                 )
                 seq_outputs[domain] = seq_out
 
-        # 【手术1】多序列门控融合，替代单一序列硬选择
+        # 3. Multi-seq fusion
         seq_meta = {'len': torch.zeros(B, device=device), 'time_span': torch.ones(B, device=device) * 86400.0}
-        
+        z_seq_fused = torch.zeros(B, self.d_model, device=device)
+
         if len(seq_outputs) > 0:
-            # 收集所有可用序列域的输出
             short_list = []
             long_list = []
             static_list = []
             len_list = []
-            
+
             for domain in self.seq_domains:
                 if domain in seq_outputs:
                     short_list.append(seq_outputs[domain]['short'])
                     long_list.append(seq_outputs[domain]['long'])
                     static_list.append(seq_outputs[domain]['static'])
                     len_list.append(model_input.seq_lens[domain])
-            
-            # 计算主序列长度（取各域最大长度作为保守估计）
+
             if len_list:
-                stacked_lens = torch.stack(len_list, dim=1)  # [B, num_domains]
+                stacked_lens = torch.stack(len_list, dim=1)
                 seq_meta['len'] = stacked_lens.max(dim=1)[0]
-                # 时间跨度：取第一个域的保守估计
-                seq_meta['time_span'] = torch.ones(B, device=device) * 86400.0
-            
-            # 多序列融合
+
             if self.num_seq_domains > 1 and len(short_list) > 1:
                 s_short, gate_short, ent_loss_short = self.seq_fusion_short(short_list)
                 s_long, gate_long, ent_loss_long = self.seq_fusion_long(long_list)
                 s_static, gate_static, ent_loss_static = self.seq_fusion_static(static_list)
-                # 缓存熵 loss（供 trainer 使用）
                 self._cached_entropy_loss = (ent_loss_short + ent_loss_long + ent_loss_static) / 3.0
-                
-                # 缓存门控权重供诊断（可选）
                 self._cached_seq_gate_short = gate_short
-                self._cached_seq_gate_long = gate_long
-                self._cached_seq_gate_static = gate_static
             else:
-                # 单域时直接取
                 s_short = short_list[0] if short_list else torch.zeros(B, self.d_model, device=device)
                 s_long = long_list[0] if long_list else torch.zeros(B, self.d_model, device=device)
                 s_static = static_list[0] if static_list else torch.zeros(B, self.d_model, device=device)
                 self._cached_entropy_loss = torch.tensor(0.0, device=device)
+
+            z_seq_fused = s_short
         else:
-            # 无任何序列域
             s_short = torch.zeros(B, self.d_model, device=device)
             s_long = torch.zeros(B, self.d_model, device=device)
             s_static = torch.zeros(B, self.d_model, device=device)
 
-        if self.num_seq_domains > 1 and len(short_list) > 1:
-            s_short, gate_short, ent_loss_short = self.seq_fusion_short(short_list)
-            s_long, gate_long, ent_loss_long = self.seq_fusion_long(long_list)
-            s_static, gate_static, ent_loss_static = self.seq_fusion_static(static_list)
-            
-            # 【缓存熵 loss】供 trainer 使用
-            # 三个熵 loss 取平均，避免过度正则
-            self._cached_entropy_loss = (ent_loss_short + ent_loss_long + ent_loss_static) / 3.0
-            
-            # 缓存门控权重供诊断
-            self._cached_seq_gate_short = gate_short
-        else:
-            # ... 单域情况 ...
-            self._cached_entropy_loss = torch.tensor(0.0, device=device)
-
-        # 3. Prototype
+        # 4. Prototype（生成式语义基座）
         proto_weights, proto_repr, kappa_mean, assign_entropy = self.prototype(
-            s_short, seq_meta, user_feat, task_id=task_id, is_training=self.training
+            z_seq_fused, seq_meta, user_feat, task_id='ctr', is_training=self.training
+        )
+        mu_u = self.prototype.get_rotated_prototypes(user_feat)  # [B, K, D]
+
+        # 5. 生成式语义层（自监督，与 CTR 梯度解耦）
+        diff_explain, diff_quality, ib_loss, recon_loss = self.diffusion_explainer(
+            z_seq_fused.detach(), proto_weights.detach(), mu_u.detach()
+        )
+        energy_score = self.energy_calibrator(
+            proto_weights.detach(), user_feat.detach(), item_feat.detach()
         )
 
-        # 3. 【手术2】显式二阶交叉
-        fields_list = [user_feat, item_feat, context_feat, s_short]
+        # 6. 显式二阶交叉（基础交互）
+        fields_list = [user_feat, item_feat, context_feat, z_seq_fused]
         crossed_fields = self.explicit_cross(fields_list)
-        user_feat, item_feat, context_feat, s_short = crossed_fields
+        u_c, i_c, c_c, s_c = crossed_fields
 
-        # 4. Cross-field
-        fields = {'user': user_feat, 'item': item_feat, 'context': context_feat, 'seq': s_short}
-        cross_out = self.cross_field(fields, seq_cond=s_short)
-
-        # 5. Final representation
+        # 7. Proto条件化场交互（核心预测能力来源，接收 CTR 梯度）
+        fields = {'user': u_c, 'item': i_c, 'context': c_c, 'seq': s_c}
+        cross_out = self.cross_field(
+            fields, seq_cond=s_c,
+            proto_weights=proto_weights.detach(),
+            diff_explain=diff_explain.detach(),
+        )
         final_repr = torch.cat([cross_out['user'], cross_out['item'],
                                 cross_out['context'], cross_out['seq']], dim=-1)
 
@@ -1446,86 +1335,53 @@ class PCVRHeteroFormer(nn.Module):
             logging.warning("【NaN防护】final_repr NaN，使用context_feat替代")
             final_repr = torch.cat([context_feat] * 4, dim=-1)
 
-        # 6. Task-specific output
-        if task_id == 'ctr':
-            gen_gates = None
-            uncertainty_pkg = {}
-            fused_repr = proto_repr
+        # 8. 正交约束（生成模块内部自监督）
+        ortho_loss = torch.abs(F.cosine_similarity(
+            F.normalize(proto_repr, dim=-1),
+            F.normalize(diff_explain, dim=-1),
+            dim=-1
+        )).mean()
 
-            # 【v9.3-RS】始终启用 fusion，eval 时 deterministic
-            if self.use_generative_fusion:
-                # 【修复3】完全 detach，切断辅助任务梯度流向共享层
-                gen_diff_repr, diff_residual = self.diff_head.get_gen_repr(
-                    proto_repr.detach(), 
-                    user_feat.detach(), 
-                    item_feat.detach(), 
-                    context_feat.detach(),
-                    deterministic=not self.training,
-                )
-                gen_energy_repr = self.energy_head.get_gen_repr(
-                    proto_repr.detach(), 
-                    user_feat.detach(), 
-                    item_feat.detach(),
-                )
+        # 9. 预测层（eval 时 energy_score 校准）
+        energy_cal = energy_score.detach() if not self.training else None
+        logits = self.ctr_head(
+            final_repr, proto_repr.detach(), proto_weights.detach(),
+            user_feat, item_feat, energy_score=energy_cal
+        )
 
-                # 计算 uncertainty 信号（no_grad，轻量）
-                with torch.no_grad():
-                    energy_batch = self.energy_head(proto_repr, user_feat, item_feat)
-                    energy_flatness = energy_batch.std()
+        if torch.isnan(logits).any():
+            logging.warning("【NaN防护】CTR logits NaN，输出零")
+            logits = torch.zeros(B, 1, device=device)
 
-                uncertainty_pkg = {
-                    'diff_residual': diff_residual.item() if torch.is_tensor(diff_residual) else float(diff_residual),
-                    'energy_flatness': energy_flatness.item() if torch.is_tensor(energy_flatness) else float(energy_flatness),
-                }
+        logits = torch.clamp(logits, min=-20.0, max=20.0)
+        temperature = torch.clamp(torch.exp(self.logit_temperature), min=0.1, max=5.0)
+        logits = logits / temperature + self.logit_bias
+        logits = torch.clamp(logits, min=-20.0, max=20.0)
 
-                fused_repr, gen_gates = self.gen_fusion(
-                    proto_repr, gen_diff_repr, gen_energy_repr
-                )
+        # 缓存（供 trainer 诊断使用）
+        self._cached_user_feat = user_feat
+        self._cached_item_feat = item_feat
+        self._cached_context_feat = context_feat
+        self._cached_proto_repr = proto_repr
+        self._cached_z_seq = z_seq_fused
+        self._cached_energy_score = energy_score
 
-            logits = self.ctr_head(final_repr, fused_repr, proto_weights, user_feat, item_feat)
+        # 10. packing loss（原型几何正则）
+        packing_loss = self.prototype.packing_loss()
 
-            if torch.isnan(logits).any():
-                logging.warning("【NaN防护】CTR logits NaN，输出零")
-                logits = torch.zeros(B, 1, device=device)
-
-            logits = torch.clamp(logits, min=-20.0, max=20.0)
-            temperature = torch.clamp(torch.exp(self.logit_temperature), min=0.1, max=5.0)
-            logits = logits / temperature + self.logit_bias
-            logits = torch.clamp(logits, min=-20.0, max=20.0)
-
-            # 缓存中间变量供 Trainer probe 复用
-            self._cached_user_feat = user_feat
-            self._cached_item_feat = item_feat
-            self._cached_context_feat = context_feat
-            self._cached_proto_repr = proto_repr
-
-            return logits, proto_weights, proto_repr, kappa_mean, assign_entropy, gen_gates, uncertainty_pkg
-
-        elif task_id == 'diff':
-            pred_noise, target_noise, t = self.diff_head(
-                proto_repr.detach(), user_feat.detach(), item_feat.detach(), context_feat.detach())
-            return pred_noise, target_noise, t
-
-        elif task_id == 'energy':
-            energy = self.energy_head(
-                proto_repr.detach(), user_feat.detach(), item_feat.detach())
-            return energy
-        else:
-            raise ValueError(f"Unknown task_id: {task_id}")
+        # 返回 12 元素（严格对齐 v10 框架）
+        return (
+            logits, proto_weights, proto_repr, kappa_mean, assign_entropy,
+            diff_explain, diff_quality, ib_loss, energy_score, recon_loss, ortho_loss, packing_loss
+        )
 
     def predict(self, model_input: ModelInput):
         with torch.no_grad():
             out = self.forward(model_input, task_id='ctr')
-        # 兼容 7 元素返回
-        if isinstance(out, tuple) and len(out) >= 6:
-            return out[0], None
         return out[0], None
 
     def get_packing_loss(self) -> Tensor:
         return self.prototype.packing_loss()
-
-    def get_fp_loss(self, z_t: Tensor, z_t_next: Tensor) -> Tensor:
-        return self.fp_regularizer(z_t, z_t_next)
 
 
 # ==============================================================================

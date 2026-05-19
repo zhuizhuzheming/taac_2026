@@ -1,4 +1,4 @@
-"""HeteroFormer training entry point — v9.1 (NaN-Resilient)."""
+"""HeteroFormer training entry point — v10 (Generative Semantics)."""
 
 import os
 import json
@@ -24,7 +24,7 @@ def build_feature_specs(schema: FeatureSchema, per_position_vocab_sizes: List[in
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="HeteroFormer Training v9.1")
+    parser = argparse.ArgumentParser(description="HeteroFormer Training v10")
 
     # Data paths
     parser.add_argument('--data_dir', type=str, default=None)
@@ -103,27 +103,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--shrinkage', type=float, default=0.05)
     parser.add_argument('--cross_network_layers', type=int, default=2)
 
-    # v9.1: Prototype Architecture 【修改】超参数调整
+    # v10: Prototype Architecture
     parser.add_argument('--num_codes', type=int, default=128)
-    parser.add_argument('--sinkhorn_epsilon', type=float, default=0.02)  # 【修改】从0.05降低
+    parser.add_argument('--sinkhorn_epsilon', type=float, default=0.02)
     parser.add_argument('--sinkhorn_iter', type=int, default=20)
     parser.add_argument('--min_mass_ratio', type=float, default=0.005)
     parser.add_argument('--coherence_threshold', type=float, default=0.15)
-    parser.add_argument('--kappa_base', type=float, default=8.0)  # 【修改】从2.0提高
+    parser.add_argument('--kappa_base', type=float, default=8.0)
     parser.add_argument('--kappa_min', type=float, default=0.5)
     parser.add_argument('--lie_rank', type=int, default=8)
 
-    # v9.1: Multi-Task Isolation 【修改】超参数调整
+    # v10: Generative Semantics Loss Weights
+    parser.add_argument('--ib_weight', type=float, default=0.01)
+    parser.add_argument('--recon_weight', type=float, default=0.05)
+    parser.add_argument('--ortho_weight', type=float, default=0.01)
+    parser.add_argument('--packing_weight', type=float, default=0.1)
+    parser.add_argument('--energy_margin', type=float, default=1.0)
+    parser.add_argument('--energy_weight', type=float, default=0.1)
+
+    # 保留旧参数定义以兼容 run.sh，但不传给 model/trainer
     parser.add_argument('--use_diffusion', action='store_true', default=True)
     parser.add_argument('--use_energy', action='store_true', default=True)
     parser.add_argument('--use_domain_adversarial', action='store_true', default=False)
-    parser.add_argument('--packing_weight', type=float, default=0.1)  # 【v9.2】保持0.1
-    parser.add_argument('--energy_margin', type=float, default=1.0)
-    parser.add_argument('--energy_weight', type=float, default=0.1)
+    parser.add_argument('--use_generative_fusion', action='store_true', default=True)
     parser.add_argument('--diff_weight', type=float, default=0.05)
-    parser.add_argument('--meta_update_interval', type=int, default=50)  # 【v9.2】从100降到50
+    parser.add_argument('--meta_update_interval', type=int, default=50)
     parser.add_argument('--curriculum_warmup', type=int, default=5000)
-    parser.add_argument('--diffusion_warmup', type=int, default=500)  # 【修改】从1000降低
+    parser.add_argument('--diffusion_warmup', type=int, default=500)
 
     # Compilation
     parser.add_argument('--compile_backend', type=str, default='inductor')
@@ -137,10 +143,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--focal_alpha_neg', type=float, default=0.4)
     parser.add_argument('--focal_max_gamma', type=float, default=4.0)
     parser.add_argument('--global_ctr', type=float, default=0.01)
-
-    # v9.3: Generative Fusion
-    parser.add_argument('--use_generative_fusion', action='store_true', default=True)
-    parser.add_argument('--no-generative_fusion', dest='use_generative_fusion', action='store_false')
 
     args = parser.parse_args()
 
@@ -251,8 +253,6 @@ def main() -> None:
         "kappa_base": args.kappa_base,
         "kappa_min": args.kappa_min,
         "lie_rank": args.lie_rank,
-        "use_domain_adversarial": args.use_domain_adversarial,
-        "use_generative_fusion": args.use_generative_fusion,
     }
 
     model = PCVRHeteroFormer(**model_args).to(args.device)
@@ -281,7 +281,7 @@ def main() -> None:
                      if 'embedding' in n or 'emb' in n.lower())
     dense_params = total_params - emb_params
 
-    logging.info(f"PCVRHeteroFormer v9.1 (NaN-Resilient)")
+    logging.info(f"PCVRHeteroFormer v10 (Generative Semantics)")
     logging.info(f"Total parameters: {total_params:,} | Embedding: {emb_params:,} | Dense: {dense_params:,}")
 
     early_stopping = EarlyStopping(
@@ -325,16 +325,12 @@ def main() -> None:
         focal_alpha_neg=args.focal_alpha_neg,
         focal_max_gamma=args.focal_max_gamma,
         global_ctr=args.global_ctr,
-        use_diffusion=args.use_diffusion,
-        use_energy=args.use_energy,
-        use_domain_adversarial=args.use_domain_adversarial,
         packing_weight=args.packing_weight,
         energy_margin=args.energy_margin,
         energy_weight=args.energy_weight,
-        diff_weight=args.diff_weight,
-        meta_update_interval=args.meta_update_interval,
-        curriculum_warmup=args.curriculum_warmup,
-        diffusion_warmup=args.diffusion_warmup,
+        ib_weight=args.ib_weight,
+        recon_weight=args.recon_weight,
+        ortho_weight=args.ortho_weight,
     )
 
     trainer.train()
