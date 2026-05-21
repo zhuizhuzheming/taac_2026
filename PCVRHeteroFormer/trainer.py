@@ -366,81 +366,66 @@ class PCVRHeteroFormerTrainer:
 
         self.optimizer.check_and_recover_nan_params(self.model)
 
-        # ================================================================
         # Phase 0: 清零所有梯度
-        # ================================================================
         self.optimizer.zero_grad_shared()
         self.optimizer.zero_grad_gen()
         self.optimizer.zero_grad_meta()
 
-        # ================================================================
-        # Phase 1: CTR Forward（生成模块内联，输出已 detach）
-        # ================================================================
+        # Phase 1: CTR Forward
         self.model.train()
         out = self.model(model_input, task_id='ctr')
 
-        # 解包 12 元素 v10 返回
         (
             logits, proto_weights, proto_repr, kappa_mean, assign_entropy,
-            diff_explain, diff_quality, ib_loss, energy_score, recon_loss, ortho_loss, packing_loss
+            diff_explain, uncertainty, gen_align_loss, energy_score,
+            packing_loss, base_logits, final_repr
         ) = out
 
         logits = logits.squeeze(-1)
+        base_logits = base_logits.squeeze(-1)
 
-        # ================================================================
-        # Phase 2: CTR loss（仅优化 shared 路径）
-        # ================================================================
+        # Phase 2: CTR loss
         if self.adaptive_focal is not None:
             loss_ctr = self.adaptive_focal(logits, labels)
         else:
             loss_ctr = F.binary_cross_entropy_with_logits(logits, labels)
 
-        # ================================================================
-        # Phase 3: 生成模块自监督 loss（仅优化 gen_module）
-        # ================================================================
-        # Energy ranking loss（自监督对比）
-        loss_energy_rank = torch.tensor(0.0, device=self.device)
-        if torch.is_tensor(energy_score) and energy_score.requires_grad:
-            loss_energy_rank = self.model.energy_calibrator.compute_ranking_loss(
-                energy_score, labels, self.energy_margin
-            )
-            if not loss_energy_rank.requires_grad:
-                loss_energy_rank = torch.tensor(0.0, device=self.device)
+        loss_ctr_base = F.binary_cross_entropy_with_logits(base_logits, labels)
 
-        loss_gen = (
-            self.ib_weight * ib_loss +
-            self.recon_weight * recon_loss +
-            self.ortho_weight * ortho_loss +
-            self.packing_weight * packing_loss +
-            self.energy_weight * loss_energy_rank
+        # Phase 3: Energy target loss
+        energy_target_loss = self.model.energy_calibrator.compute_target(
+            energy_score, base_logits.detach(), labels
         )
 
-        # ================================================================
-        # Phase 4: MetaAligner 决策（仅输出 aux_weight）
-        # ================================================================
+        # Phase 4: Gen loss
+        gen_loss = (
+            gen_align_loss +
+            energy_target_loss * 0.1 +
+            packing_loss * self.packing_weight
+        )
+
+        # Phase 5: 【关键】计算 residual_benefit 后传入 MetaAligner
+        with torch.no_grad():
+            residual_benefit = loss_ctr_base.item() - loss_ctr.item()
+
         valid_auc = self.valid_auc_history[-1] if self.valid_auc_history else None
         train_auc_latest = self.train_auc_history[-1] if self.train_auc_history else None
         grad_norms = self.optimizer.get_grad_norms()
 
         meta = self.model.meta_aligner(
-            losses={'ctr': loss_ctr.item(), 'gen': loss_gen.item()},
-            grad_norms=grad_norms,
             valid_auc=valid_auc,
             train_auc=train_auc_latest,
             global_step=self.global_step,
             ctr_loss=loss_ctr.item(),
-            uncertainty_mean=energy_score.mean().item() if torch.is_tensor(energy_score) else 0.0,
-            diff_quality=diff_quality.mean().item() if torch.is_tensor(diff_quality) else 0.5,
+            uncertainty_mean=uncertainty.mean().item(),
+            residual_benefit=residual_benefit,
         )
 
         aux_weight = meta['aux_weight']
 
-        # ================================================================
-        # Phase 5: 总 Loss 与单次 Backward（架构 detach 保证梯度隔离）
-        # ================================================================
-        total_loss = loss_ctr + aux_weight * loss_gen
+        # Phase 6: 总 Loss
+        total_loss = loss_ctr + aux_weight * gen_loss
 
-        # NaN 安全
         total_loss = torch.where(
             torch.isnan(total_loss) | torch.isinf(total_loss),
             torch.tensor(0.0, device=total_loss.device),
@@ -449,9 +434,7 @@ class PCVRHeteroFormerTrainer:
 
         total_loss.backward()
 
-        # ================================================================
-        # Phase 6: 梯度检查与参数更新
-        # ================================================================
+        # Phase 7: 梯度检查与参数更新
         has_nan_grad = False
         ctr_grad_norm = 0.0
         for p in self.model.parameters():
@@ -471,19 +454,16 @@ class PCVRHeteroFormerTrainer:
             self.optimizer.record_grad_norm('ctr', self.model)
             self.optimizer.record_grad_norm('gen', self.model)
             self.optimizer.step_shared()
-            if loss_gen.item() > 0:
+            if gen_loss.item() > 0:
                 self.optimizer.step_gen()
             grad_norm_ctr = self.optimizer.grad_norm_history['ctr'][-1] if self.optimizer.grad_norm_history['ctr'] else 0.0
 
-        # ================================================================
-        # Phase 7: 更新历史 & Logging
-        # ================================================================
+        # Phase 8: 更新历史 & Logging
         if self.adaptive_focal is not None:
             self.adaptive_focal.step()
 
         self.global_step += 1
 
-        # 计算 train_auc
         with torch.no_grad():
             logits_mean = logits.mean().item()
             logits_std = logits.std().item()
@@ -499,12 +479,11 @@ class PCVRHeteroFormerTrainer:
         # TensorBoard logging
         if self.writer:
             self.writer.add_scalar('Loss/ctr', loss_ctr.item(), self.global_step)
-            self.writer.add_scalar('Loss/gen', loss_gen.item(), self.global_step)
-            self.writer.add_scalar('Loss/ib', ib_loss.item(), self.global_step)
-            self.writer.add_scalar('Loss/recon', recon_loss.item(), self.global_step)
-            self.writer.add_scalar('Loss/ortho', ortho_loss.item(), self.global_step)
+            self.writer.add_scalar('Loss/ctr_base', loss_ctr_base.item(), self.global_step)
+            self.writer.add_scalar('Loss/gen', gen_loss.item(), self.global_step)
+            self.writer.add_scalar('Loss/gen_align', gen_align_loss.item(), self.global_step)
+            self.writer.add_scalar('Loss/energy_target', energy_target_loss.item(), self.global_step)
             self.writer.add_scalar('Loss/packing', packing_loss.item(), self.global_step)
-            self.writer.add_scalar('Loss/energy_rank', loss_energy_rank.item(), self.global_step)
             self.writer.add_scalar('Loss/total', total_loss.item(), self.global_step)
             self.writer.add_scalar('Stream/logits_mean', logits_mean, self.global_step)
             self.writer.add_scalar('Stream/logits_std', logits_std, self.global_step)
@@ -518,24 +497,15 @@ class PCVRHeteroFormerTrainer:
             self.writer.add_scalar('Meta/gap', meta.get('gap', 0.0), self.global_step)
             self.writer.add_scalar('Meta/aux_weight', meta.get('aux_weight', 0.0), self.global_step)
             self.writer.add_scalar('Meta/ema_aux', meta.get('ema_aux', 0.0), self.global_step)
-            self.writer.add_scalar('Meta/steps_since_valid', meta.get('steps_since_valid', 0), self.global_step)
+            self.writer.add_scalar('Meta/residual_benefit', meta.get('residual_benefit', 0.0), self.global_step)
 
-            self.writer.add_scalar('Gen/ib_loss', ib_loss.item(), self.global_step)
-            self.writer.add_scalar('Gen/recon_loss', recon_loss.item(), self.global_step)
-            self.writer.add_scalar('Gen/ortho_loss', ortho_loss.item(), self.global_step)
-            self.writer.add_scalar('Gen/diff_quality', diff_quality.mean().item(), self.global_step)
-            self.writer.add_scalar('Gen/energy_mean', energy_score.mean().item() if torch.is_tensor(energy_score) else 0.0, self.global_step)
+            self.writer.add_scalar('Gen/uncertainty_mean', uncertainty.mean().item(), self.global_step)
+            self.writer.add_scalar('Gen/energy_mean', energy_score.mean().item(), self.global_step)
+            self.writer.add_scalar('Gen/energy_std', energy_score.std().item(), self.global_step)
 
-            if hasattr(self.model, '_cached_seq_gate_short') and self.model._cached_seq_gate_short is not None:
-                gate_short = self.model._cached_seq_gate_short
-                for i, domain in enumerate(self.model.seq_domains):
-                    if i < gate_short.size(1):
-                        self.writer.add_scalar(f'SeqFusion/short_{domain}',
-                                              gate_short[:, i].mean().item(), self.global_step)
-
-            if hasattr(self.model, 'explicit_cross') and self.model.explicit_cross is not None:
-                cross_norm = self.model.explicit_cross.cross_weights.norm().item()
-                self.writer.add_scalar('CrossLayer/weight_norm', cross_norm, self.global_step)
+            self.writer.add_scalar('Residual/benefit', residual_benefit, self.global_step)
+            self.writer.add_scalar('Residual/base_vs_final_logits',
+                (base_logits.mean() - logits.mean()).item(), self.global_step)
 
         # Console log
         if self.global_step % 100 == 0:
@@ -543,38 +513,36 @@ class PCVRHeteroFormerTrainer:
                 f"[Step {self.global_step}]",
                 f"mode={meta.get('mode', '?')}",
                 f"ctr={loss_ctr.item():.4f}",
-                f"gen={loss_gen.item():.4f}",
-                f"ib={ib_loss.item():.4f}",
-                f"recon={recon_loss.item():.4f}",
-                f"ortho={ortho_loss.item():.4f}",
-                f"pack={packing_loss.item():.4f}",
-                f"e_rank={loss_energy_rank.item():.4f}",
+                f"ctr_base={loss_ctr_base.item():.4f}",
+                f"gen={gen_loss.item():.4f}",
+                f"align={gen_align_loss.item():.4f}",
+                f"e_target={energy_target_loss.item():.4f}",
                 f"total={total_loss.item():.4f}",
                 f"logits={logits_mean:.3f}±{logits_std:.3f}",
                 f"trAUC={train_auc:.4f}",
                 f"k={kappa_mean.item():.2f}",
-                f"ent={assign_entropy.mean().item():.2f}",
                 f"grad={grad_norm_ctr:.2f}",
                 f"nanR={self.optimizer.nan_recovery_count}",
                 f"meta=[ctr=1.0,aux={meta.get('aux_weight', 0.0):.3f}]",
                 f"gap={meta.get('gap', 0.0):.3f}",
-                f"diffQ={diff_quality.mean().item():.3f}",
-                f"energy={energy_score.mean().item():.3f}" if torch.is_tensor(energy_score) else "energy=0.0",
+                f"resBen={residual_benefit:+.3f}",
+                f"unc={uncertainty.mean().item():.3f}",
+                f"energy={energy_score.mean().item():.3f}",
             ]
             logging.info(" | ".join(log_parts))
 
         return {
             'loss_ctr': loss_ctr.item(),
-            'loss_gen': loss_gen.item(),
-            'loss_ib': ib_loss.item(),
-            'loss_recon': recon_loss.item(),
-            'loss_ortho': ortho_loss.item(),
+            'loss_ctr_base': loss_ctr_base.item(),
+            'loss_gen': gen_loss.item(),
+            'loss_gen_align': gen_align_loss.item(),
+            'loss_energy_target': energy_target_loss.item(),
             'loss_packing': packing_loss.item(),
-            'loss_energy_rank': loss_energy_rank.item(),
             'total_loss': total_loss.item(),
             'train_auc': train_auc,
             'meta_mode': meta.get('mode', 'unknown'),
             'meta_aux_weight': meta.get('aux_weight', 0.0),
+            'residual_benefit': residual_benefit,
         }
 
     def evaluate(self, epoch: Optional[int] = None) -> Tuple[float, float]:

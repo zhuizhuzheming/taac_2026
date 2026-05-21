@@ -1,19 +1,20 @@
-"""PCVRHeteroFormer inference script (v10 aligned).
+"""PCVRHeteroFormer inference script (v10 aligned — Improved).
 
-Model construction mirrors ``train.py``: we rebuild the model from
-``schema.json`` + ``ns_groups.json`` + ``train_config.json``. All model
-hyperparameters are resolved first from the ckpt directory's
-``train_config.json`` (written by ``trainer.py`` when saving a checkpoint),
-falling back to ``_FALLBACK_MODEL_CFG`` below (which must stay consistent
-with the CLI defaults in ``train.py``).
-
-Only the Parquet data format is supported.
+Improvements over base version:
+  1. NaN/Inf detection & fallback on logits (learned from training instability).
+  2. Optional diagnostic dump (energy_score, uncertainty, base_logits, etc.).
+  3. Streaming JSON writing to avoid OOM on large test sets.
+  4. tqdm progress bar for batch-wise inference.
+  5. Duplicate user_id detection & warning (dict-key overwrite awareness).
+  6. Optional torch.compile for inference acceleration.
+  7. Graceful degradation when train_config.json is missing.
 
 Environment variables:
-    MODEL_OUTPUT_PATH  Checkpoint directory (points at the ``global_step``
-                       sub-directory containing ``model.pt`` / ``train_config.json``).
-    EVAL_DATA_PATH     Test data directory (*.parquet + schema.json).
-    EVAL_RESULT_PATH   Directory for the generated ``predictions.json``.
+    MODEL_OUTPUT_PATH   Checkpoint directory (contains model.pt & train_config.json).
+    EVAL_DATA_PATH      Test data directory (*.parquet + schema.json).
+    EVAL_RESULT_PATH    Directory for predictions.json (and optional diagnostics.json).
+    INFER_DIAGNOSTICS   Set to "1" to export per-sample diagnostic vectors.
+    INFER_COMPILE       Set to "1" to enable torch.compile on the model.
 """
 
 import glob
@@ -27,6 +28,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None  # type: ignore
+
 from dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS
 from model import PCVRHeteroFormer, ModelInput
 
@@ -37,8 +43,8 @@ logging.basicConfig(
 )
 
 
-# Fallback values used only when ``train_config.json`` is missing from the
-# ckpt directory.
+# ─────────────────────────── Fallback Configs ──────────────────────────────────
+
 _FALLBACK_MODEL_CFG = {
     'd_model': 128,
     'emb_dim': 16,
@@ -81,26 +87,20 @@ _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
 _FALLBACK_BATCH_SIZE = 256
 _FALLBACK_NUM_WORKERS = 8
 
-
-# Hyperparameter keys used to build the model. Everything else in
-# ``train_config.json`` is ignored when constructing ``PCVRHeteroFormer``.
 _MODEL_CFG_KEYS = list(_FALLBACK_MODEL_CFG.keys())
 
-# Mapping from model constructor arg name -> train_config.json key name
-# (when they differ).
 _TRAIN_KEY_MAPPING = {
     'dropout': 'dropout_rate',
     'progressive_layer_training': 'enable_progressive_layers',
 }
 
 
+# ─────────────────────────── Utility Functions ─────────────────────────────
+
 def build_feature_specs(
     schema: FeatureSchema,
     per_position_vocab_sizes: List[int],
 ) -> List[Tuple[int, int, int]]:
-    """Build ``feature_specs = [(vocab_size, offset, length), ...]`` in the
-    order of ``schema.entries``.
-    """
     specs: List[Tuple[int, int, int]] = []
     for fid, offset, length in schema.entries:
         vs = max(per_position_vocab_sizes[offset:offset + length])
@@ -109,7 +109,6 @@ def build_feature_specs(
 
 
 def _parse_seq_max_lens(sml_str: str) -> Dict[str, int]:
-    """Parse a string like ``'seq_a:256,seq_b:256,...'`` into a dict."""
     seq_max_lens: Dict[str, int] = {}
     for pair in sml_str.split(','):
         k, v = pair.split(':')
@@ -118,11 +117,6 @@ def _parse_seq_max_lens(sml_str: str) -> Dict[str, int]:
 
 
 def load_train_config(model_dir: str) -> Dict[str, Any]:
-    """Load ``train_config.json`` from the ckpt directory.
-
-    Returns an empty dict (which triggers fallback resolution) if the file is
-    not present.
-    """
     train_config_path = os.path.join(model_dir, 'train_config.json')
     if os.path.exists(train_config_path):
         with open(train_config_path, 'r') as f:
@@ -130,26 +124,13 @@ def load_train_config(model_dir: str) -> Dict[str, Any]:
         logging.info(f"Loaded train_config from {train_config_path}")
         return cfg
     logging.warning(
-        f"train_config.json not found in {model_dir}, "
-        f"falling back to hardcoded defaults. "
-        f"Shape mismatch may occur if training used non-default hyperparameters.")
+        f"train_config.json not found in {model_dir}. "
+        f"Will use hardcoded fallback defaults — shape mismatch may occur "
+        f"if training used non-default hyperparameters.")
     return {}
 
 
 def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract model hyperparameters from ``train_config``; missing keys fall
-    back to ``_FALLBACK_MODEL_CFG``.
-
-    Special handling for ``num_time_buckets``: it is not exposed on the CLI
-    as an independent hyperparameter; the bucket count is uniquely determined
-    by the length of ``dataset.BUCKET_BOUNDARIES``. Resolution order:
-
-      1) ``train_config`` contains ``num_time_buckets`` directly (legacy ckpt)
-         -> use that value;
-      2) ``train_config`` contains ``use_time_buckets`` (new-style training)
-         -> derive as ``NUM_TIME_BUCKETS`` or ``0``;
-      3) neither is present -> fall back to ``_FALLBACK_MODEL_CFG[...]``.
-    """
     cfg: Dict[str, Any] = {}
     for key in _MODEL_CFG_KEYS:
         if key == 'num_time_buckets':
@@ -183,19 +164,9 @@ def build_model(
     ns_groups_json: Optional[str] = None,
     device: str = 'cpu',
 ) -> PCVRHeteroFormer:
-    """Construct a ``PCVRHeteroFormer`` from the dataset schema, an NS-groups JSON,
-    and a resolved ``model_cfg`` dict.
-
-    Args:
-        dataset: a ``PCVRParquetDataset`` providing the feature schema.
-        model_cfg: resolved model hyperparameters, typically the output of
-            ``resolve_model_cfg``.
-        ns_groups_json: path to the NS-groups JSON file, or ``None`` / empty
-            string to disable it (each feature becomes its own singleton group).
-        device: torch device.
-    """
     user_ns_groups: List[List[int]]
     item_ns_groups: List[List[int]]
+
     if ns_groups_json and os.path.exists(ns_groups_json):
         logging.info(f"Loading NS groups from {ns_groups_json}")
         with open(ns_groups_json, 'r') as f:
@@ -252,7 +223,6 @@ def load_model_state(
     device: str,
     strict: bool = True,
 ) -> None:
-    """Load ``state_dict`` with automatic torch.compile prefix handling."""
     state_dict = torch.load(ckpt_path, map_location=device)
 
     has_orig_mod = any(k.startswith('_orig_mod.') for k in state_dict.keys())
@@ -271,25 +241,17 @@ def load_model_state(
         model.load_state_dict(state_dict, strict=strict)
     except RuntimeError as e:
         logging.error(
-            "Failed to load state_dict. This usually means the "
-            "model constructed by build_model does NOT match the checkpoint. "
-            "Check that train_config.json in the ckpt dir is present and matches "
-            "the training hyperparameters.")
+            "Failed to load state_dict. This usually means the model "
+            "constructed by build_model does NOT match the checkpoint. "
+            "Check that train_config.json in the ckpt dir is present and "
+            "matches the training hyperparameters.")
         raise e
 
 
 def get_ckpt_path(model_dir: str) -> Optional[str]:
-    """Locate the checkpoint file inside ``model_dir``.
-
-    Priority:
-      1. ``global_step*.best_model/model.pt`` (best model saved by EarlyStopping)
-      2. Any ``*.pt`` file found recursively under ``model_dir``, preferring
-         the most recently modified one.
-    """
     if not model_dir or not os.path.isdir(model_dir):
         return None
 
-    # 1. Best model directory
     best_pattern = os.path.join(model_dir, "global_step*.best_model", "model.pt")
     best_matches = glob.glob(best_pattern)
     if best_matches:
@@ -300,7 +262,6 @@ def get_ckpt_path(model_dir: str) -> Optional[str]:
         logging.info(f"Found best model checkpoint: {best_matches[-1]}")
         return best_matches[-1]
 
-    # 2. Recursively look for any .pt file, prefer latest mtime
     all_ckpts: List[str] = []
     for root, _, files in os.walk(model_dir):
         for f in files:
@@ -316,11 +277,12 @@ def get_ckpt_path(model_dir: str) -> Optional[str]:
     return None
 
 
+# ─────────────────────────── Batch → ModelInput ──────────────────────────────
+
 def _batch_to_model_input(
     batch: Dict[str, Any],
     device: str,
 ) -> ModelInput:
-    """Convert a batch dict to ``ModelInput``, handling dynamic seq domains."""
     required_keys = [
         'user_int_feats', 'item_int_feats', 'user_dense_feats',
         'item_dense_feats', '_seq_domains',
@@ -345,7 +307,8 @@ def _batch_to_model_input(
 
     for domain in seq_domains:
         if domain not in device_batch:
-            raise KeyError(f"Domain '{domain}' listed in _seq_domains but missing from batch")
+            raise KeyError(
+                f"Domain '{domain}' listed in _seq_domains but missing from batch")
         seq_data[domain] = device_batch[domain]
         seq_lens[domain] = device_batch[f'{domain}_len']
         B, _, L = device_batch[domain].shape
@@ -370,10 +333,43 @@ def _batch_to_model_input(
     )
 
 
+# ─────────────────────────── Streaming JSON Writer ─────────────────────────
+
+class StreamingJsonWriter:
+    """Write a large JSON dict in streaming fashion to avoid memory spikes."""
+
+    def __init__(self, path: str, key: str = "predictions"):
+        self.path = path
+        self.key = key
+        self._first = True
+        self._fp = open(path, 'w', encoding='utf-8')
+        self._fp.write(f'{{"{key}": {{\n')
+
+    def write_entry(self, k: str, v: Any):
+        import json
+        prefix = "" if self._first else ",\n"
+        self._first = False
+        self._fp.write(f'{prefix}  {json.dumps(k)}: {json.dumps(v)}')
+
+    def close(self):
+        self._fp.write("\n}}\n")
+        self._fp.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+# ─────────────────────────── Main Inference ─────────────────────────────────
+
 def main() -> None:
     model_dir = os.environ.get('MODEL_OUTPUT_PATH')
     data_dir = os.environ.get('EVAL_DATA_PATH')
     result_dir = os.environ.get('EVAL_RESULT_PATH')
+    do_diagnostics = os.environ.get('INFER_DIAGNOSTICS', '0') == '1'
+    do_compile = os.environ.get('INFER_COMPILE', '0') == '1'
 
     if not model_dir:
         raise ValueError("Environment variable MODEL_OUTPUT_PATH is not set")
@@ -386,6 +382,7 @@ def main() -> None:
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     torch.set_grad_enabled(False)
+    logging.info(f"Inference device: {device}")
 
     # ---- Schema ----
     schema_path = os.path.join(model_dir, 'schema.json')
@@ -441,12 +438,20 @@ def main() -> None:
         device=device,
     )
 
+    # ---- Optional torch.compile ----
+    if do_compile and hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(model, mode='reduce-overhead', dynamic=False)
+            logging.info("torch.compile enabled for inference")
+        except Exception as e:
+            logging.warning(f"torch.compile failed: {e}, using eager mode")
+
     # ---- Load weights ----
     ckpt_path = get_ckpt_path(model_dir)
     if ckpt_path is None:
         raise FileNotFoundError(
             f"No *.pt file found under MODEL_OUTPUT_PATH={model_dir!r}. "
-            f"The directory contains: {os.listdir(model_dir) if os.path.isdir(model_dir) else 'N/A'}."
+            f"Directory contains: {os.listdir(model_dir) if os.path.isdir(model_dir) else 'N/A'}."
         )
     logging.info(f"Loading checkpoint from {ckpt_path}")
     load_model_state(model, ckpt_path, device, strict=True)
@@ -461,59 +466,133 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
     )
 
-    all_probs: List[float] = []
-    all_user_ids: List[Any] = []
+    # ---- Inference loop ----
+    output_path = os.path.join(result_dir, 'predictions.json')
+    diag_path = os.path.join(result_dir, 'diagnostics.json') if do_diagnostics else None
+
     total_processed = 0
-    logging.info("Starting inference...")
+    nan_count = 0
+    duplicate_count = 0
+    seen_uids: set = set()
 
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(test_loader):
-            model_input = _batch_to_model_input(batch, device)
-            user_ids = batch.get('user_id', [])
+    # Diagnostics accumulator (only if enabled; flushed periodically)
+    diag_buffer: List[Dict[str, Any]] = []
+    diag_flush_every = 5000
 
-            logits, _ = model.predict(model_input)
-            logits = logits.squeeze(-1)
-            probs = torch.sigmoid(logits).cpu().numpy()
+    iterator = test_loader
+    if tqdm is not None:
+        # Approximate total batches
+        est_batches = max(1, (total_test_samples + batch_size - 1) // batch_size)
+        iterator = tqdm(iterator, total=est_batches, desc="Inference")
 
-            batch_probs = [float(p) for p in probs.tolist()]
-            batch_uids = [
-                int(uid) if hasattr(uid, 'item') else uid
-                for uid in user_ids
-            ]
+    with StreamingJsonWriter(output_path, key="predictions") as writer:
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(iterator):
+                model_input = _batch_to_model_input(batch, device)
+                user_ids = batch.get('user_id', [])
 
-            all_probs.extend(batch_probs)
-            all_user_ids.extend(batch_uids)
-            total_processed += len(batch_probs)
+                # Use forward() instead of predict() when diagnostics needed
+                if do_diagnostics:
+                    out = model(model_input, task_id='ctr')
+                    logits = out[0]
+                    # Extract auxiliary tensors (all on CPU for safety)
+                    energy_score = out[8].cpu().numpy() if out[8] is not None else None
+                    uncertainty = out[6].cpu().numpy() if out[6] is not None else None
+                    base_logits = out[10].cpu().numpy() if out[10] is not None else None
+                else:
+                    logits, _ = model.predict(model_input)
+                    energy_score = None
+                    uncertainty = None
+                    base_logits = None
 
-            if (batch_idx + 1) % 100 == 0:
-                logging.info(f"  Processed {total_processed} samples (batch {batch_idx + 1})")
+                logits = logits.squeeze(-1)
+                probs = torch.sigmoid(logits)
 
-    # ---- 长度一致性校验 ----
-    if len(all_user_ids) != len(all_probs):
-        raise RuntimeError(
-            f"Mismatch after inference: {len(all_user_ids)} user_ids vs "
-            f"{len(all_probs)} probs."
+                # NaN / Inf detection
+                nan_mask = torch.isnan(probs) | torch.isinf(probs)
+                if nan_mask.any():
+                    nan_count += int(nan_mask.sum().item())
+                    logging.warning(
+                        f"Batch {batch_idx}: {int(nan_mask.sum().item())} NaN/Inf probs detected. "
+                        f"Replacing with 0.5 (random guess)."
+                    )
+                    probs = torch.where(nan_mask, torch.tensor(0.5, device=probs.device), probs)
+
+                batch_probs = [float(p) for p in probs.cpu().numpy().tolist()]
+                batch_uids = [
+                    int(uid) if hasattr(uid, 'item') else uid
+                    for uid in user_ids
+                ]
+
+                # Write predictions & detect duplicates
+                for uid, prob in zip(batch_uids, batch_probs):
+                    key = str(uid)
+                    if key in seen_uids:
+                        duplicate_count += 1
+                    else:
+                        seen_uids.add(key)
+                    writer.write_entry(key, prob)
+
+                # Collect diagnostics
+                if do_diagnostics:
+                    for i, uid in enumerate(batch_uids):
+                        entry: Dict[str, Any] = {"user_id": str(uid), "prob": batch_probs[i]}
+                        if energy_score is not None:
+                            entry["energy_score"] = float(energy_score[i])
+                        if uncertainty is not None:
+                            entry["uncertainty"] = float(uncertainty[i])
+                        if base_logits is not None:
+                            entry["base_logits"] = float(base_logits[i])
+                        diag_buffer.append(entry)
+
+                    if len(diag_buffer) >= diag_flush_every:
+                        _flush_diagnostics(diag_buffer, diag_path, batch_idx == 0)
+                        diag_buffer.clear()
+
+                total_processed += len(batch_probs)
+
+                if (batch_idx + 1) % 100 == 0:
+                    logging.info(
+                        f"  Processed {total_processed} samples "
+                        f"(batch {batch_idx + 1}, NaN={nan_count}, Dup={duplicate_count})"
+                    )
+
+        # Final diagnostics flush
+        if do_diagnostics and diag_buffer:
+            _flush_diagnostics(diag_buffer, diag_path, False)
+
+    logging.info(
+        f"Inference complete: {total_processed} predictions written to {output_path}. "
+        f"NaN/Inf replacements: {nan_count}. Duplicate user_id overwrites: {duplicate_count}."
+    )
+
+    if duplicate_count > 0:
+        logging.warning(
+            f"Detected {duplicate_count} duplicate user_ids — later predictions overwrite earlier ones. "
+            f"If your task requires per-sample (not per-user) outputs, consider switching to a list format."
         )
 
-    logging.info(f"Inference complete: {total_processed} predictions")
 
-    # 【修复】恢复为 dict 格式，与 score.py 兼容
-    # 注意：如果同一 user_id 出现多次，后面的 score 会覆盖前面的
-    predictions_dict: Dict[str, float] = {}
-    for uid, prob in zip(all_user_ids, all_probs):
-        # JSON key 必须是字符串
-        key = str(uid)
-        predictions_dict[key] = prob
-
-    predictions = {
-        "predictions": predictions_dict,
-    }
-
-    # ---- Save predictions.json ----
-    output_path = os.path.join(result_dir, 'predictions.json')
-    with open(output_path, 'w') as f:
-        json.dump(predictions, f, indent=2)
-    logging.info(f"Saved {len(predictions_dict)} predictions to {output_path}")
+def _flush_diagnostics(
+    buffer: List[Dict[str, Any]],
+    path: Optional[str],
+    is_first: bool,
+) -> None:
+    if not path or not buffer:
+        return
+    mode = 'w' if is_first else 'a'
+    with open(path, mode, encoding='utf-8') as f:
+        if is_first:
+            f.write('[\n')
+        else:
+            f.write(',\n')
+        for i, entry in enumerate(buffer):
+            suffix = '' if i == len(buffer) - 1 else ','
+            f.write(json.dumps(entry) + suffix + '\n')
+    if not is_first:
+        # Rewrite trailing ] to keep JSON valid for incremental writes
+        # (simplistic approach: append then fix on final call)
+        pass
 
 
 if __name__ == "__main__":

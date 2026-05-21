@@ -72,16 +72,16 @@ train_args=(
     # v10 关键参数
     --kappa_base 2.0
     --sinkhorn_epsilon 0.05
-    --packing_weight 0.1
+    --packing_weight 0.01
 
     # 【v10 新增】生成式语义层自监督权重
-    --ib_weight 0.01             # 信息瓶颈约束
-    --recon_weight 0.05          # 重建质量
-    --ortho_weight 0.01          # 正交约束
+    --ib_weight 0.0             # 信息瓶颈约束
+    --recon_weight 0.0          # 重建质量
+    --ortho_weight 0.0          # 正交约束
 
     # 【v10 保留】Energy 校准器参数
     --energy_margin 1.0
-    --energy_weight 0.1
+    --energy_weight 0.0
 
     # 【v10 移除】以下参数已废弃，由架构内部自动管理
     # --use_diffusion              # 已移除：DiffusionExplainer 内联

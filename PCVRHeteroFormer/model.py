@@ -638,32 +638,28 @@ class DynamicPrototypeManifold(nn.Module):
 # ==============================================================================
 
 class DiffusionExplainer(nn.Module):
-    """信息瓶颈编码器：将原型-序列联合分布编码到瓶颈空间，输出可解释语义 diff_explain"""
-
     def __init__(self, d_model: int, num_codes: int, bottleneck_dim: Optional[int] = None, dropout_rate: float = 0.15):
         super().__init__()
-        bottleneck_dim = bottleneck_dim or max(16, d_model // 4)
+        bottleneck_dim = bottleneck_dim or max(32, d_model // 2)
+        self.d_model = d_model
         self.bottleneck_dim = bottleneck_dim
 
-        # 编码器：z_seq + proto_res_pooled + proto_weights
-        self.encoder = nn.Sequential(
+        self.residual_encoder = nn.Sequential(
             nn.Linear(d_model * 2 + num_codes, d_model),
             nn.LayerNorm(d_model), nn.SiLU(), nn.Dropout(dropout_rate),
-            nn.Linear(d_model, bottleneck_dim * 2),  # mu, logvar
+            nn.Linear(d_model, bottleneck_dim),
         )
 
-        # 可解释表示投影
-        self.explain_proj = nn.Sequential(
-            nn.Linear(bottleneck_dim, d_model),
-            nn.LayerNorm(d_model), nn.SiLU(), nn.Dropout(dropout_rate),
-            nn.Linear(d_model, d_model),
+        # 【修复】输出维度改为 d_model * 4，与 final_repr 对齐
+        self.residual_proj = nn.Sequential(
+            nn.Linear(bottleneck_dim, d_model * 4),
+            nn.LayerNorm(d_model * 4), nn.SiLU(),
+            nn.Linear(d_model * 4, d_model * 4),
         )
 
-        # 重建解码器
-        self.decoder = nn.Sequential(
-            nn.Linear(bottleneck_dim, d_model),
-            nn.LayerNorm(d_model), nn.SiLU(),
-            nn.Linear(d_model, d_model),
+        self.uncertainty_head = nn.Sequential(
+            nn.Linear(bottleneck_dim, 1),
+            nn.Softplus(),
         )
 
         for m in self.modules():
@@ -672,35 +668,37 @@ class DiffusionExplainer(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, z_seq: Tensor, proto_weights: Tensor, proto_res: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        # proto_res: [B, K, D]（旋转后的原型矩阵）
+    def forward(self, z_seq: Tensor, proto_weights: Tensor, proto_res: Tensor,
+                ctr_repr: Tensor, ctr_logits: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         B = z_seq.size(0)
-        # 池化原型矩阵为 [B, D]
         proto_pooled = torch.einsum('bk,bkd->bd', proto_weights, proto_res)
         x = torch.cat([z_seq, proto_pooled, proto_weights], dim=-1)
 
-        h = self.encoder(x)
-        mu, logvar = h.chunk(2, dim=-1)
-        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
-        std = torch.exp(0.5 * logvar)
+        h = self.residual_encoder(x)
+        diff_explain = self.residual_proj(h)  # 【修复】现在输出 [B, d_model*4]
+        uncertainty = self.uncertainty_head(h).squeeze(-1)
+        uncertainty = torch.clamp(uncertainty, min=0.01, max=5.0)
 
-        eps = torch.randn_like(std)
-        z = mu + std * eps if self.training else mu
+        # 对齐约束：diff_explain 应与 ctr_repr 正交
+        ctr_norm = F.normalize(ctr_repr.detach(), dim=-1)
+        diff_proj = (diff_explain * ctr_norm).sum(dim=-1, keepdim=True) * ctr_norm
+        diff_orthogonal = diff_explain - diff_proj
 
-        # IB loss: KL(q(z|x) || N(0,1))
-        ib_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1).mean()
-        ib_loss = torch.clamp(ib_loss, max=20.0)
+        align_loss = (diff_proj ** 2).mean()
+        diversity_bonus = (diff_orthogonal ** 2).mean() * 0.1
 
-        diff_explain = self.explain_proj(z)
-        recon = self.decoder(z)
-        recon_loss = F.mse_loss(recon, z_seq.detach(), reduction='mean')
-
+        # 残差目标
         with torch.no_grad():
-            err = F.mse_loss(recon, z_seq, reduction='none').mean(dim=-1)
-            sig = (z_seq ** 2).mean(dim=-1).clamp(min=1e-8)
-            diff_quality = torch.exp(-err / sig * 5)
+            p = torch.sigmoid(ctr_logits)
+            boundary_mask = ((p > 0.3) & (p < 0.7)).float()
+            target_residual_mag = boundary_mask * 0.5
 
-        return diff_explain, diff_quality, ib_loss, recon_loss
+        residual_mag = (diff_explain ** 2).mean(dim=-1)
+        residual_target_loss = F.mse_loss(residual_mag, target_residual_mag)
+
+        total_gen_loss = align_loss - diversity_bonus + residual_target_loss * 0.1
+
+        return diff_explain, uncertainty, total_gen_loss
 
 
 # ==============================================================================
@@ -708,10 +706,12 @@ class DiffusionExplainer(nn.Module):
 # ==============================================================================
 
 class EnergyCalibrator(nn.Module):
+    """【v10.2】误差预测器：高 energy = CTR 预测可能错误"""
+
     def __init__(self, d_model: int, num_codes: int, dropout_rate: float = 0.15):
         super().__init__()
-        self.energy_net = nn.Sequential(
-            nn.Linear(num_codes + d_model * 2, d_model),
+        self.error_predictor = nn.Sequential(
+            nn.Linear(num_codes + d_model * 2 + 1, d_model),
             nn.LayerNorm(d_model), nn.SiLU(), nn.Dropout(dropout_rate),
             nn.Linear(d_model, d_model // 2), nn.SiLU(),
             nn.Linear(d_model // 2, 1),
@@ -723,30 +723,21 @@ class EnergyCalibrator(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, proto_weights: Tensor, user_feat: Tensor, item_feat: Tensor) -> Tensor:
-        x = torch.cat([proto_weights, user_feat, item_feat], dim=-1)
-        energy = self.energy_net(x).squeeze(-1)
-        return torch.clamp(energy, min=0.0, max=10.0)
+    def forward(self, proto_weights: Tensor, user_feat: Tensor, item_feat: Tensor,
+                ctr_logits: Tensor) -> Tensor:
+        x = torch.cat([
+            proto_weights, user_feat, item_feat,
+            ctr_logits.abs().unsqueeze(-1)
+        ], dim=-1)
+        energy = self.error_predictor(x).squeeze(-1)
+        return torch.clamp(energy, min=0.01, max=3.0)
 
-    def compute_ranking_loss(self, energy: Tensor, labels: Tensor, margin: float = 1.0) -> Tensor:
-        """自监督对比排序：正样本能量应低于负样本"""
-        pos_mask = labels > 0.5
-        neg_mask = ~pos_mask
-        pos_idx = torch.where(pos_mask)[0]
-        neg_idx = torch.where(neg_mask)[0]
-        n_pos = pos_idx.numel()
-        n_neg = neg_idx.numel()
-        if n_pos == 0 or n_neg == 0:
-            return torch.tensor(0.0, device=energy.device)
-        n_sample = min(5, n_neg)
-        if n_neg > n_sample:
-            neg_sample_idx = neg_idx[torch.randperm(n_neg, device=energy.device)[:n_sample]]
-        else:
-            neg_sample_idx = neg_idx
-        pos_e = energy[pos_idx]
-        neg_e = energy[neg_sample_idx]
-        diff = pos_e.unsqueeze(1) - neg_e.unsqueeze(0) + margin
-        return F.relu(diff).mean()
+    def compute_target(self, energy: Tensor, ctr_logits: Tensor, labels: Tensor) -> Tensor:
+        with torch.no_grad():
+            p = torch.sigmoid(ctr_logits)
+            bce = F.binary_cross_entropy(p, labels, reduction='none')
+            target_energy = torch.clamp(bce * 5.0, min=0.01, max=3.0)
+        return F.mse_loss(energy, target_energy)
 
 
 # ==============================================================================
@@ -775,15 +766,20 @@ class ProtoConditionedCrossFieldLayer(nn.Module):
         super().__init__()
         self.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
         self.attn_norm = nn.LayerNorm(d_model)
-        # proto_weights → 场注意力偏置
         self.proto_bias_proj = nn.Linear(num_codes, d_model)
         self.film = SeqFiLM(d_model)
         hidden = int(d_model * ffn_ratio)
         self.ffn = nn.Sequential(nn.Linear(d_model, hidden), nn.SiLU(), nn.Linear(hidden, d_model))
         self.ffn_norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
-        # diff_explain → 场门控（可选）
+        
+        # 【修复】diff_explain 投影：支持 d_model*4 输入
+        self.diff_proj_gate = nn.Sequential(
+            nn.Linear(d_model * 4, d_model),
+            nn.LayerNorm(d_model), nn.SiLU(),
+        )
         self.diff_gate = nn.Sequential(nn.Linear(d_model, d_model), nn.Sigmoid())
+        
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=0.1)
@@ -795,16 +791,19 @@ class ProtoConditionedCrossFieldLayer(nn.Module):
                 diff_explain: Optional[Tensor] = None) -> Tensor:
         attn_out, _ = self.attn(x, x, x)
         if proto_weights is not None:
-            # 温和场偏置：避免主导原始注意力
-            proto_bias = self.proto_bias_proj(proto_weights).unsqueeze(1)  # [B, 1, D]
+            proto_bias = self.proto_bias_proj(proto_weights).unsqueeze(1)
             attn_out = attn_out + 0.05 * proto_bias
         x = self.attn_norm(x + attn_out)
         x = self.dropout(x)
         x = self.film(x, seq_cond)
         ffn_out = self.ffn(x)
+        
         if diff_explain is not None:
-            gate = self.diff_gate(diff_explain).unsqueeze(1)  # [B, 1, D]
+            # 【修复】先投影到 d_model 维
+            diff_cond = self.diff_proj_gate(diff_explain)  # [B, d_model*4] -> [B, d_model]
+            gate = self.diff_gate(diff_cond).unsqueeze(1)  # [B, 1, d_model]
             ffn_out = ffn_out * gate
+            
         x = self.ffn_norm(x + ffn_out)
         x = self.dropout(x)
         return x
@@ -827,7 +826,7 @@ class ProtoConditionedCrossFieldNet(nn.Module):
     def forward(self, fields: Dict[str, Tensor], seq_cond: Tensor,
                 proto_weights: Optional[Tensor] = None,
                 diff_explain: Optional[Tensor] = None) -> Dict[str, Tensor]:
-        x = torch.stack([fields[f] for f in self.fields], dim=1)  # [B, F, D]
+        x = torch.stack([fields[f] for f in self.fields], dim=1)
         x = x + self.field_emb.unsqueeze(0)
         for layer in self.layers:
             x = layer(x, seq_cond, proto_weights=proto_weights, diff_explain=diff_explain)
@@ -839,6 +838,8 @@ class ProtoConditionedCrossFieldNet(nn.Module):
 # ==============================================================================
 
 class CalibratedCTRHead(nn.Module):
+    """【v10.2】残差融合：diff_explain 作为可学习的修正项"""
+
     def __init__(self, d_model: int, num_codes: int, dropout_rate: float = 0.15):
         super().__init__()
         self.static_proj = nn.Sequential(
@@ -847,46 +848,65 @@ class CalibratedCTRHead(nn.Module):
         self.proto_proj = nn.Sequential(
             nn.Linear(d_model, d_model), nn.LayerNorm(d_model)
         )
-        # 双尺度门控：static / proto
+
         self.gate = nn.Sequential(
-            nn.Linear(d_model * 2 + num_codes, d_model),
+            nn.Linear(d_model * 2 + num_codes + 1, d_model),
             nn.LayerNorm(d_model), nn.SiLU(),
-            nn.Linear(d_model, 2), nn.Softmax(dim=-1),
+            nn.Linear(d_model, 3), nn.Softmax(dim=-1),
         )
-        # 正样本残差聚焦
+
+        self.residual_fusion = nn.Sequential(
+            nn.Linear(d_model * 4, d_model), nn.LayerNorm(d_model), nn.SiLU()
+        )
+
         self.pos_residual = nn.Sequential(
             nn.Linear(d_model, d_model // 2), nn.SiLU(), nn.Linear(d_model // 2, d_model)
         )
         self.output = nn.Linear(d_model, 1, bias=True)
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
-        # CVR ≈ 5% 先验 log-odds ≈ -2.94，给模型合理起点
         nn.init.constant_(self.output.bias, -2.0)
         nn.init.xavier_uniform_(self.output.weight, gain=0.1)
 
     def forward(self, final_repr: Tensor, proto_repr: Tensor, proto_weights: Tensor,
-                user_feat: Tensor, item_feat: Tensor, energy_score: Optional[Tensor] = None) -> Tensor:
+                user_feat: Tensor, item_feat: Tensor,
+                diff_explain: Optional[Tensor] = None,
+                uncertainty: Optional[Tensor] = None) -> Tensor:
         static = self.static_proj(final_repr)
         proto = self.proto_proj(proto_repr)
-        # 正样本模式注入：防止全员预测负类躺平
+
         proto_activations = proto_weights.max(dim=-1, keepdim=True)[0]
         pos_boost = torch.sigmoid(proto_activations - 0.5) * self.pos_residual(proto)
+
         context = torch.cat([user_feat, item_feat], dim=-1)
-        gate_input = torch.cat([context, proto_weights], dim=-1)
-        g = self.gate(gate_input)  # [B, 2]
+
+        gate_input = [context, proto_weights]
+        if uncertainty is not None:
+            gate_input.append(uncertainty.unsqueeze(-1))
+        else:
+            gate_input.append(torch.zeros(context.size(0), 1, device=context.device))
+
+        gate_input = torch.cat(gate_input, dim=-1)
+        g = self.gate(gate_input)
+
         fused = g[:, 0:1] * static + g[:, 1:2] * (proto + pos_boost)
+
+        if diff_explain is not None:
+            residual = self.residual_fusion(diff_explain)
+            residual_weight = g[:, 2:3]
+            if uncertainty is not None:
+                uncertainty_gate = torch.sigmoid(uncertainty - 1.0).unsqueeze(-1)
+                residual_weight = residual_weight * (0.5 + 0.5 * uncertainty_gate)
+            fused = fused + residual_weight * residual
+
         fused = self.dropout(fused)
         logits = self.output(fused)
-        # eval 时 energy_score 校准：高不确定性降低 logit
-        if energy_score is not None and not self.training:
-            with torch.no_grad():
-                cal = -0.1 * (energy_score - energy_score.mean()).unsqueeze(-1)
-                logits = logits + cal
-        # 动态偏置校正：防止 logits 无限下钻
+
         if self.training:
             with torch.no_grad():
                 lm = logits.mean()
                 if lm < -3.0:
                     self.output.bias.data += 0.01 * (-3.0 - lm)
+
         return logits
 
 
@@ -903,7 +923,7 @@ class MetaAligner(nn.Module):
         kp: float = 2.0,
         ki: float = 0.02,
         kd: float = 1.0,
-        max_aux_weight: float = 0.15,
+        max_aux_weight: float = 0.1,
         leak_rate: float = 0.03,
         valid_decay_rate: float = 0.98,
         ema_fast: float = 0.7,
@@ -928,6 +948,7 @@ class MetaAligner(nn.Module):
         self.register_buffer('last_valid_gap', torch.tensor(0.0))
         self.register_buffer('steps_since_valid', torch.tensor(0))
         self.register_buffer('ema_aux', torch.tensor(0.0))
+        self.register_buffer('ema_residual_benefit', torch.tensor(0.0))
 
         self.gap_history = deque(maxlen=10)
         self.aux_history = deque(maxlen=10)
@@ -949,21 +970,27 @@ class MetaAligner(nn.Module):
     def _interpolate_without_valid(self, base_aux: float) -> float:
         steps = int(self.steps_since_valid.item())
         decay = self.valid_decay_rate ** steps
-        conservative = 0.05
+        conservative = 0.01
         return conservative + (base_aux - conservative) * decay
 
     def forward(
         self,
-        losses: Dict[str, float],
-        grad_norms: Dict[str, float],
+        *,
         valid_auc: Optional[float] = None,
         train_auc: Optional[float] = None,
         global_step: int = 0,
         ctr_loss: Optional[float] = None,
         uncertainty_mean: Optional[float] = None,
-        diff_quality: Optional[float] = None,
+        residual_benefit: Optional[float] = None,
     ) -> Dict[str, Any]:
-        # 计算当前 gap
+        
+        # 【v10.2】核心：基于残差收益调度
+        if residual_benefit is not None:
+            self.ema_residual_benefit = 0.9 * self.ema_residual_benefit + 0.1 * residual_benefit
+        
+        rb = float(self.ema_residual_benefit.item())
+
+        # 计算过拟合 gap
         gap = 0.0
         if train_auc is not None and valid_auc is not None and valid_auc > 0:
             gap = max(0.0, train_auc - valid_auc)
@@ -974,38 +1001,24 @@ class MetaAligner(nn.Module):
             self.steps_since_valid += 1
             gap = float(self.last_valid_gap.item()) * 1.01
 
-        # CTR loss 趋势信号
-        ctr_trend = 0.0
-        if ctr_loss is not None:
-            if not hasattr(self, '_ctr_loss_history'):
-                self._ctr_loss_history = deque(maxlen=5)
-            if len(self._ctr_loss_history) > 0:
-                last_ctr = self._ctr_loss_history[-1]
-                ctr_trend = max(0.0, (ctr_loss - last_ctr) / max(abs(last_ctr), 1e-8))
-            self._ctr_loss_history.append(ctr_loss)
+        # 基于残差收益决定 target_aux
+        if rb > 0.005:
+            target_aux = min(self.max_aux_weight, 0.03 + rb * 0.5)
+        elif rb < -0.01:
+            target_aux = 0.0
+        else:
+            target_aux = 0.02
 
-        # 不确定性信号
-        uncertainty_signal = 0.0
-        if uncertainty_mean is not None:
-            uncertainty_signal = max(0.0, uncertainty_mean - 1.0)
-
-        # PID 控制
-        integral = self._leaky_integrate(gap + 0.5 * ctr_trend + 0.3 * uncertainty_signal)
-        gap_trend = 0.0
-        if len(self.gap_history) >= 2:
-            gap_trend = (self.gap_history[-1] - self.gap_history[0]) / len(self.gap_history)
-
-        P = self.kp * gap
-        I = self.ki * integral
-        D = self.kd * (-gap_trend)
-        raw_aux = max(0.0, P + I + D)
+        # 过拟合作为硬上限
+        if gap > 0.03:
+            target_aux *= max(0.1, 1.0 - (gap - 0.03) * 10.0)
 
         # Valid 间插值
         if valid_auc is None or valid_auc <= 0:
-            raw_aux = self._interpolate_without_valid(raw_aux)
+            target_aux = self._interpolate_without_valid(target_aux)
 
-        # 自适应 EMA
-        new_ema = self._adaptive_ema(raw_aux, float(self.ema_aux.item()))
+        # EMA 平滑
+        new_ema = self._adaptive_ema(target_aux, float(self.ema_aux.item()))
         self.ema_aux = torch.tensor(new_ema)
         aux_weight = min(self.max_aux_weight, new_ema)
 
@@ -1013,7 +1026,7 @@ class MetaAligner(nn.Module):
             'aux_weight': aux_weight,
             'ctr_weight': 1.0,
             'gap': gap,
-            'integral': integral,
+            'residual_benefit': rb,
             'mode': 'valid_pid' if (valid_auc and valid_auc > 0) else 'interpolated',
             'ema_aux': new_ema,
             'steps_since_valid': int(self.steps_since_valid.item()),
@@ -1268,11 +1281,7 @@ class PCVRHeteroFormer(nn.Module):
         z_seq_fused = torch.zeros(B, self.d_model, device=device)
 
         if len(seq_outputs) > 0:
-            short_list = []
-            long_list = []
-            static_list = []
-            len_list = []
-
+            short_list, long_list, static_list, len_list = [], [], [], []
             for domain in self.seq_domains:
                 if domain in seq_outputs:
                     short_list.append(seq_outputs[domain]['short'])
@@ -1302,32 +1311,20 @@ class PCVRHeteroFormer(nn.Module):
             s_long = torch.zeros(B, self.d_model, device=device)
             s_static = torch.zeros(B, self.d_model, device=device)
 
-        # 4. Prototype（生成式语义基座）
+        # 4. Prototype
         proto_weights, proto_repr, kappa_mean, assign_entropy = self.prototype(
             z_seq_fused, seq_meta, user_feat, task_id='ctr', is_training=self.training
         )
-        mu_u = self.prototype.get_rotated_prototypes(user_feat)  # [B, K, D]
+        mu_u = self.prototype.get_rotated_prototypes(user_feat)
 
-        # 5. 生成式语义层（自监督，与 CTR 梯度解耦）
-        diff_explain, diff_quality, ib_loss, recon_loss = self.diffusion_explainer(
-            z_seq_fused.detach(), proto_weights.detach(), mu_u.detach()
-        )
-        energy_score = self.energy_calibrator(
-            proto_weights.detach(), user_feat.detach(), item_feat.detach()
-        )
-
-        # 6. 显式二阶交叉（基础交互）
+        # 5. 显式二阶交叉
         fields_list = [user_feat, item_feat, context_feat, z_seq_fused]
         crossed_fields = self.explicit_cross(fields_list)
         u_c, i_c, c_c, s_c = crossed_fields
 
-        # 7. Proto条件化场交互（核心预测能力来源，接收 CTR 梯度）
+        # 6. 基础 CTR 路径（无残差）
         fields = {'user': u_c, 'item': i_c, 'context': c_c, 'seq': s_c}
-        cross_out = self.cross_field(
-            fields, seq_cond=s_c,
-            proto_weights=proto_weights.detach(),
-            diff_explain=diff_explain.detach(),
-        )
+        cross_out = self.cross_field(fields, seq_cond=s_c)
         final_repr = torch.cat([cross_out['user'], cross_out['item'],
                                 cross_out['context'], cross_out['seq']], dim=-1)
 
@@ -1335,18 +1332,34 @@ class PCVRHeteroFormer(nn.Module):
             logging.warning("【NaN防护】final_repr NaN，使用context_feat替代")
             final_repr = torch.cat([context_feat] * 4, dim=-1)
 
-        # 8. 正交约束（生成模块内部自监督）
-        ortho_loss = torch.abs(F.cosine_similarity(
-            F.normalize(proto_repr, dim=-1),
-            F.normalize(diff_explain, dim=-1),
-            dim=-1
-        )).mean()
+        base_logits = self.ctr_head(
+            final_repr, proto_repr, proto_weights,
+            user_feat, item_feat, diff_explain=None, uncertainty=None
+        ).squeeze(-1)
 
-        # 9. 预测层（eval 时 energy_score 校准）
-        energy_cal = energy_score.detach() if not self.training else None
+        # 7. 生成模块：以 CTR 残差为目标
+        diff_explain, uncertainty, gen_align_loss = self.diffusion_explainer(
+            z_seq_fused, proto_weights, mu_u,
+            ctr_repr=final_repr, ctr_logits=base_logits.detach()
+        )
+
+        energy_score = self.energy_calibrator(
+            proto_weights, user_feat, item_feat, base_logits.detach()
+        )
+
+        # 8. 用 diff_explain 重新计算 cross_field
+        cross_out = self.cross_field(
+            fields, seq_cond=s_c,
+            proto_weights=proto_weights,
+            diff_explain=diff_explain,
+        )
+        final_repr = torch.cat([cross_out['user'], cross_out['item'],
+                                   cross_out['context'], cross_out['seq']], dim=-1)
+
+        # 9. 最终预测
         logits = self.ctr_head(
-            final_repr, proto_repr.detach(), proto_weights.detach(),
-            user_feat, item_feat, energy_score=energy_cal
+            final_repr, proto_repr, proto_weights,
+            user_feat, item_feat, diff_explain=diff_explain, uncertainty=uncertainty
         )
 
         if torch.isnan(logits).any():
@@ -1358,7 +1371,7 @@ class PCVRHeteroFormer(nn.Module):
         logits = logits / temperature + self.logit_bias
         logits = torch.clamp(logits, min=-20.0, max=20.0)
 
-        # 缓存（供 trainer 诊断使用）
+        # 缓存
         self._cached_user_feat = user_feat
         self._cached_item_feat = item_feat
         self._cached_context_feat = context_feat
@@ -1366,14 +1379,14 @@ class PCVRHeteroFormer(nn.Module):
         self._cached_z_seq = z_seq_fused
         self._cached_energy_score = energy_score
 
-        # 10. packing loss（原型几何正则）
         packing_loss = self.prototype.packing_loss()
 
-        # 返回 12 元素（严格对齐 v10 框架）
         return (
             logits, proto_weights, proto_repr, kappa_mean, assign_entropy,
-            diff_explain, diff_quality, ib_loss, energy_score, recon_loss, ortho_loss, packing_loss
+            diff_explain, uncertainty, gen_align_loss, energy_score,
+            packing_loss, base_logits, final_repr
         )
+
 
     def predict(self, model_input: ModelInput):
         with torch.no_grad():
