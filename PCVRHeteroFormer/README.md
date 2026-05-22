@@ -1,469 +1,385 @@
-# PCVRHeteroFormer v9.3-RSOU
+# PCVRHeteroFormer v10 — Generative Semantics & Decoupled Optimization
 
-## 技术架构总览
-
-PCVRHeteroFormer 是一个面向**点击后转化率（Post-Click Conversion Rate, PCVR）**预测的深度推荐模型。其核心设计哲学是：将推荐系统中的"序列建模"与"特征交互"从传统的"拼接-压缩"范式，升级为**"流形嵌入-场域动力学-表示手术"**的三层协同范式。
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         PCVRHeteroFormer v9.3-RSOU                          │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  Layer 3: 表示手术层 (Representation Surgery)                                │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  GenerativeFusion (残差融合)                                        │    │
-│  │  MetaAligner (双模式调度器: Train-schedule + Valid-PID)             │    │
-│  │  CTRHead / DiffusionHead / EnergyHead (隔离任务头)                   │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                              ↓                                              │
-│  Layer 2: 场域动力学层 (Field Dynamics)                                     │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  CrossFieldNet (跨场域注意力网络, FiLM条件化)                        │    │
-│  │  LangevinForceField (朗之万力场, 不确定性建模)                        │    │
-│  │  DynamicPrototypeManifold (动态原型流形, Sinkhorn分配)              │    │
-│  │  CayleyRotation (凯莱旋转, 用户条件化几何)                          │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                              ↓                                              │
-│  Layer 1: 序列嵌入层 (Sequential Embedding)                               │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  MultiViewEncoder (多视角编码器, 用户/物品/上下文分离)                │    │
-│  │  ContinuousSequenceEncoder (连续序列编码器, SSM状态空间模型)        │    │
-│  │  SSMCell (结构化状态空间单元, 时间感知)                              │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+> **版本**: v10.2  
+> **主题**: 生成式语义原型 + 解耦优化框架  
+> **适用任务**: 点击转化率（CVR）预估 / 用户行为序列建模
 
 ---
 
-## 一、序列建模：从"离散索引"到"连续动力学"
+## 1. 概述
 
-### 1.1 问题背景
-
-传统推荐模型的序列建模通常采用：
-- **Transformer 式自注意力**：将序列视为离散 token 的集合，通过位置编码捕捉时序
-- **GRU/LSTM 式循环**：逐步压缩历史，但难以建模长程依赖与连续时间间隔
-
-这两种范式的共同缺陷是：**将时间视为"位置索引"而非"物理量"**。在 PCVR 场景中，用户行为序列的时间间隔（上次点击距今 1 小时 vs. 1 周）具有直接的语义意义，不应被平等对待。
-
-### 1.2 SSMCell：结构化状态空间单元
-
-SSMCell 的设计灵感来源于**连续时间信号处理中的状态空间模型（State Space Model）**，将序列建模重新框架化为**线性时不变系统的离散化**：
-
-```
-连续形式:    ḣ(t) = A·h(t) + B·x(t)     (状态演化)
-            y(t) = C·h(t) + D·x(t)     (观测输出)
-
-离散形式:    h_k = Ā·h_{k-1} + B̄·x_k   (其中 Ā = exp(A·Δt))
-```
-
-**关键创新点**：
-
-| 组件 | 传统离散 RNN | SSMCell | 物理意义 |
-|------|------------|---------|---------|
-| 状态矩阵 A | 随机初始化/正交约束 | `A_real = -exp(linspace(0, 3, state_dim))` | 不同维度具有**指数衰减的时间常数**，模拟多尺度记忆 |
-| 离散化步长 Δt | 固定为 1 | `delta_proj(time_deltas)` → Softplus 裁剪 | 将原始时间差（秒）映射为**自适应离散化步长** |
-| 输入投影 B | 线性层 | `B_proj(x_seq)` + 硬裁剪 [-10, 10] | 防止极端输入破坏状态演化 |
-| 输出投影 C | 线性层 | `C_proj(h_states)` | 从隐藏状态重构观测 |
-| 跳跃连接 D | 常数或参数 | `D_skip`（可学习，初始 0.5） | 保留原始输入的"高频成分" |
-
-**累积求和的高效实现**：
-
-传统 RNN 的逐步递归 `h_k = Ā_k · h_{k-1} + B̄_k · x_k` 在 GPU 上难以并行。SSMCell 通过**对数空间累积和（log-space cumsum）**实现向量化：
-
-```python
-logA = torch.log(A_discrete.clamp(min=1e-10))
-cumsum_logA = torch.cumsum(logA, dim=1)       # 并行前缀和
-prefix_A = torch.exp(cumsum_logA)              # 累积衰减因子
-weighted_Bx = Bx / prefix_A_safe               # 归一化输入
-cumsum_weighted = torch.cumsum(weighted_Bx, dim=1)  # 并行累积
-h_states = prefix_A * cumsum_weighted          # 最终状态
-```
-
-这等价于**并行扫描（parallel scan）**算法，将 O(L) 的串行依赖转化为 O(log L) 的并行树规约，在保持连续时间语义的同时实现 GPU 友好。
-
-### 1.3 ContinuousSequenceEncoder：序列的多尺度池化
-
-SSMCell 输出的是**完整序列的隐藏状态** `h ∈ [B, L, D]`，但 CTR 预测需要**压缩为固定长度的用户向量**。ContinuousSequenceEncoder 设计了三尺度池化机制：
-
-```
-┌────────────────────────────────────────┐
-│  ContinuousSequenceEncoder 输出结构      │
-├────────────────────────────────────────┤
-│  'short'  : 近程注意力池化               │
-│            时间权重: exp(-t/10s)        │
-│            物理意义: 短期兴趣（最近几次行为）│
-├────────────────────────────────────────┤
-│  'long'   : 均匀平均池化                 │
-│            时间权重: 1/L_valid            │
-│            物理意义: 长期偏好（历史全貌）  │
-├────────────────────────────────────────┤
-│  'static' : 统计特征投影                 │
-│            输入: [mean, std, last]       │
-│            物理意义: 序列的宏观统计指纹    │
-├────────────────────────────────────────┤
-│  'full_seq': 完整隐藏序列 (保留用于原型)  │
-└────────────────────────────────────────┘
-```
-
-**空序列处理**：对于无历史行为的新用户，不使用零填充（导致梯度消失），而是学习一个**参数化的空状态分布**：
-
-```python
-empty_mu = nn.Parameter(torch.randn(d_model) * 0.1)
-empty_log_sigma = nn.Parameter(torch.randn(d_model) * 0.01 - 2.0)
-empty_state = empty_mu + exp(empty_log_sigma) * noise  # 重参数化采样
-```
-
-这使得模型能区分"无历史"与"历史被掩码"两种语义，并为冷启动用户提供有意义的随机初始化表示。
+PCVRHeteroFormer v10 是一套面向**异构特征空间**与**长程行为序列**的深度 CTR/CVR 预估框架。本版本的核心创新在于引入**生成式语义层（Generative Semantics）**，通过**动态原型流形（Dynamic Prototype Manifold）**将用户行为序列编码为可解释的语义原型分布，并采用**解耦优化（Decoupled Optimization）**策略实现生成模块与判别模块的梯度隔离，从而在保持主任务（CTR）稳定训练的同时，利用自监督信号提升序列表征质量。
 
 ---
 
-## 二、特征交互：从"内积/拼接"到"流形-场域动力学"
-
-### 2.1 问题背景
-
-传统特征交互方法（FM、DeepFM、DCN）假设：
-- 特征嵌入存在于**固定欧氏空间**
-- 交互强度由**静态内积**度量
-- 用户/物品表示是**独立学习**的
-
-PCVRHeteroFormer 的核心洞见是：**用户兴趣与物品属性应在"条件化黎曼流形"上交互**，而非平坦的向量空间。
-
-### 2.2 DynamicPrototypeManifold：动态原型流形
-
-这是整个模型的**几何心脏**。它将用户的历史序列压缩嵌入到一个**可学习的原型流形**上：
+## 2. 核心架构
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│              DynamicPrototypeManifold 工作流程                   │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  1. 全局原型 η ∈ R^(num_codes × code_dim)                      │
-│     → 可学习参数，代表"理想化兴趣原子"                          │
-│                                                                 │
-│  2. 用户条件化旋转: CayleyRotation                              │
-│     → 输入: user_feat (用户画像)                                │
-│     → 输出: μ_u = Rotate(η; user_feat)                         │
-│     → 物理意义: 同一原型，不同用户看到不同"视角"                │
-│                                                                 │
-│  3. 序列-原型匹配: von Mises-Fisher 分布                        │
-│     → cosine_sim = z_norm · μ_u^T  (归一化余弦相似度)           │
-│     → log_probs = κ · tanh(cosine_sim)                           │
-│     → κ: 浓度参数（用户条件化，控制"分配锐度"）                │
-│                                                                 │
-│  4. 最优传输分配: LangevinSinkhorn                              │
-│     → 将 log_probs 视为成本矩阵 C = -log_probs                  │
-│     → 通过熵正则化 Sinkhorn 迭代求解最优传输计划 Π               │
-│     → 添加 Langevin 噪声防止坍缩到退化分配                      │
-│                                                                 │
-│  5. 原型加权聚合:                                               │
-│     → proto_repr = Σ_k Π_k · μ_u,k   (软分配加权平均)           │
-│     → 空序列回退: empty_prior (学习到的均匀/偏置分布)           │
-│                                                                 │
+│                        输入层 (Input Layer)                       │
+│  ├─ 用户离散特征 (User Int)                                      │
+│  ├─ 物品离散特征 (Item Int)                                      │
+│  ├─ 用户稠密特征 (User Dense)                                    │
+│  ├─ 物品稠密特征 (Item Dense)                                    │
+│  └─ 多域行为序列 (Multi-Domain Sequences: seq_a/b/c/d)           │
 └─────────────────────────────────────────────────────────────────┘
-```
-
-**von Mises-Fisher (vMF) 分布的语义**：
-
-在欧氏空间中，softmax 内积 `exp(z·μ)` 假设向量模长任意。vMF 通过**显式归一化** `z_norm = z/||z||` 和 **浓度参数 κ**，将匹配度转化为**球面上的概率密度**：
-
-```
-p(z | μ, κ) ∝ exp(κ · μ^T · z)    where ||z|| = ||μ|| = 1
-```
-
-- κ → 0: 均匀分布（对所有原型无偏好）
-- κ → ∞: 退化到最近原型（硬聚类）
-
-κ 被设计为**用户条件化 + 时间衰减**：活跃用户（近期行为多）获得高 κ（锐分配），沉默用户获得低 κ（探索性分配）。
-
-**LangevinSinkhorn 的作用**：
-
-标准 Sinkhorn 迭代 `u = -logsumexp(log(K) + v)` 是确定性的。LangevinSinkhorn 在最后几步注入噪声：
-
-```python
-for _ in range(langevin_steps):
-    u = -torch.logsumexp(...)  # 标准 Sinkhorn 步
-    v = -torch.logsumexp(...)
-    u = u + randn_like(u) * noise_scale  # Langevin 扰动
-    v = v + randn_like(v) * noise_scale
-```
-
-这等价于在**传输计划的空间中进行随机梯度下降**，防止所有样本坍缩到同一原型（模式崩溃），同时保持边际约束。
-
-### 2.3 CrossFieldNet：跨场域注意力网络
-
-原型流形提供了**序列侧的压缩表示**，但 PCVR 还需要建模**用户画像、物品属性、上下文、序列**四者之间的交互。CrossFieldNet 将这四者视为**物理场（field）**，通过场间动力学实现交互：
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                  CrossFieldNet 场域结构                        │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  输入场:  {user, item, context, seq}                         │
-│                                                             │
-│  场嵌入:  field_emb ∈ R^(4 × d_model)                       │
-│           → 每个场有一个可学习的"类型标识向量"              │
-│                                                             │
-│  层操作:  CrossFieldLayer × num_layers                      │
-│           ├─ MultiheadSelfAttention: 场间信息交换           │
-│           ├─ SeqFiLM: 序列场作为条件调制其他场              │
-│           └─ FFN: 场内非线性变换                            │
-│                                                             │
-│  输出场:  {user', item', context', seq'}                    │
-│           → 每个场都吸收了其他场的信息                        │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**SeqFiLM（序列条件化特征线性调制）**：
-
-传统 FiLM 用全局向量生成 scale/shift。SeqFiLM 用**序列压缩表示** `s_short` 作为条件：
-
-```python
-gamma = sigmoid(W_γ · s_short)   # [B, d_model]
-beta  = W_β · s_short             # [B, d_model]
-output_field = input_field * gamma.unsqueeze(1) + beta.unsqueeze(1)
-```
-
-这意味着：**序列场不直接参与交互，而是作为"控制器"调制其他场的表达**。物理类比：序列是"磁场"，其他场是"磁化材料"——磁场不改变自身，但改变材料的响应方式。
-
-### 2.4 LangevinForceField：朗之万力场（不确定性建模）
-
-CrossFieldNet 建模的是**确定性交互**，但真实推荐中存在**固有不确定性**（用户行为随机性、数据噪声）。LangevinForceField 将四场表示视为**统计力学中的粒子**，通过朗之万方程建模其随机演化：
-
-```
-朗之万方程:
-    dq/dt = p/M                     (位置演化)
-    dp/dt = -γ·p + F(q) + √(2γT)·ξ  (动量演化，含噪声)
-
-离散化 (Verlet-like):
-    q_half = q + 0.5·dt·p/M
-    F_det = ForceNet(q_half)         # 确定性力（神经网络）
-    F = F_det + noise_scale·randn    # 添加热噪声
-    p = p·(1-γ·dt) + F·dt            # 阻尼更新
-    q = q_half + 0.5·dt·p/M          # 位置更新
-```
-
-**可解释性**：
-- `M = exp(mass_log)`: 各场各维度的"惯性质量"——质量大的场更难被外力改变（用户画像通常比上下文质量大）
-- `γ = softplus(gamma_log)`: 阻尼系数——高阻尼意味着系统快速达到稳态（短序列场景）
-- `T = softplus(temperature_log)`: 温度——高温增加随机性，低温趋向确定性
-- `uncertainty_head`: 从最终状态预测**各场各维度的不确定性**，用于后续门控决策
-
----
-
-## 三、表示手术：Train/Eval 一致性修正
-
-### 3.1 问题诊断
-
-v9.3 原版的设计存在一个**结构性缺陷**：
-
-```python
-# 原版
-if self.use_generative_fusion and self.training:   # ← eval 时跳过
-    fused = gate0*proto + gate1*diff + gate2*energy
-else:
-    fused = proto   # ← eval 回退
-```
-
-这导致：
-- **Train**：CTR head 学习 `fused_repr` 的分布（含 diff/energy 修正）
-- **Eval**：CTR head 突然看到 `proto_repr`（完全不同的分布）
-- **后果**：valid_auc 可能被人为压低，MetaAligner 误判过拟合，错误地提升辅助权重
-
-### 3.2 残差融合（Representation Surgery）
-
-v9.3-RS 将融合重新框架化为**残差修正**：
-
-```python
-# 新版
-delta_diff = gen_diff_repr - proto_repr
-delta_energy = gen_energy_repr - proto_repr
-fused = proto_repr + gate1*delta_diff + gate2*delta_energy
-```
-
-**语义转变**：
-
-| 维度 | 旧版（竞争性） | 新版（增量性） |
-|------|--------------|--------------|
-| gate1=0, gate2=0 | `fused = proto`（通过 g0=1 实现） | `fused = proto`（恒等映射） |
-| gate1>0 | diff "抢夺" proto 的份额 | diff 提供**修正方向**，proto 作为基线保留 |
-| Eval 行为 | 完全丢弃 diff/energy | 保留融合结构，仅将随机采样改为确定性中值 |
-| 训练稳定性 | softmax 竞争可能导致梯度冲突 | 残差项天然有梯度衰减（接近 0 时影响小） |
-
-**确定性 Eval 路径**：
-
-```python
-# DiffusionHead.get_gen_repr(deterministic=True)
-t = num_steps // 2          # 固定为中间步（而非随机采样）
-noise = zeros_like(proto)    # 零噪声（而非高斯噪声）
-```
-
-这使得 eval 时的 `gen_diff_repr` 是 `proto_repr` 的**确定性函数**，而非随机变量。CTR head 在 train/eval 看到的是**同一流形上的不同点**（train 是流形上的随机游走，eval 是固定锚点），而非**两个不同的流形**。
-
----
-
-## 四、MetaAligner：双模式训练调度器
-
-### 4.1 设计动机
-
-传统多任务学习的权重调度通常依赖**验证集指标**（如 GradNorm、DWA、PCGrad），这在以下场景失效：
-- 验证频率低（每 epoch 一次）
-- 验证集与训练集分布偏移（时序数据）
-- 早期训练阶段验证指标噪声大
-
-MetaAligner 设计为**双模式状态机**：
-
-```
+                              ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│                        MetaAligner 状态机                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  Step 0~300:    WARMUP                                          │
-│                 → alpha = [1.0, 0.0, 0.0]                       │
-│                 → 纯 CTR 预热，但 Probe 已启动记录                │
-│                                                                 │
-│  Step 300~500:  PROBE_BURN_IN                                   │
-│                 → alpha = [1.0, 0.0, 0.0]                       │
-│                 → 积累 diff/energy 的 uncertainty 信号           │
-│                                                                 │
-│  Step 500+:     ┌─────────────────────────────────────────┐      │
-│                 │ 分支 A: VALID_PID (valid_auc 可用且历史≥2)│      │
-│                 │  → 经典 PID 控制: gap = train_auc - valid_auc │
-│                 │                                              │      │
-│                 │ 分支 B: TRAIN_SCHEDULE (无 valid_auc)      │      │
-│                 │  → Online Uncertainty 驱动:                   │      │
-│                 │     health = f(plateau, grad_fatigue,          │      │
-│                 │              confidence, proto_chaos,           │      │
-│                 │              diff_residual)                   │      │
-│                 └─────────────────────────────────────────┘      │
-│                                                                 │
+│                    基础编码层 (Base Encoding)                      │
+│  ├─ MultiViewEncoder ──→ 用户/物品/上下文表征 (z_shared)          │
+│  └─ ContinuousSequenceEncoder ──→ SSM-based 序列编码             │
+│       (short / long / static / full_seq)                        │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                  生成式语义层 (Generative Semantics)                │
+│  ├─ DynamicPrototypeManifold                                    │
+│  │   ├─ CayleyRotation ──→ 用户条件化原型旋转                     │
+│  │   ├─ LangevinSinkhorn ──→ 最优传输分配                        │
+│  │   └─ 输出: proto_weights, proto_repr, kappa                  │
+│  ├─ DiffusionExplainer ──→ 信息瓶颈残差编码 (diff_explain)        │
+│  └─ EnergyCalibrator ──→ 预测误差能量估计 (energy_score)          │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                  特征交互层 (Feature Interaction)                   │
+│  ├─ BilinearCrossLayer ──→ 显式二阶域间交互                     │
+│  └─ ProtoConditionedCrossFieldNet                               │
+│       ├─ Multi-Head Self-Attention                               │
+│       ├─ Proto-bias Attention (温和注入原型权重)                   │
+│       ├─ SeqFiLM 条件化调制                                      │
+│       └─ Diff-gate FFN (扩散解释门控)                            │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    预测层 (Prediction Head)                       │
+│  └─ CalibratedCTRHead                                           │
+│       ├─ Static / Proto / Pos-boost 三路融合                     │
+│       ├─ Uncertainty-gated Residual (diff_explain)               │
+│       └─ 温度缩放 + 自适应偏置 (logit_temperature/bias)          │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                   元控制层 (Meta Control)                         │
+│  └─ MetaAligner ──→ 过拟合感知辅助权重调度 (aux_weight)            │
+│       ├─ 残差收益驱动 (residual_benefit)                         │
+│       ├─ 过拟合硬上限 (train-valid AUC gap)                     │
+│       └─ Valid-AUC 缺失时保守插值                               │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 Online Uncertainty 信号
+---
 
-当 valid_auc 不可用时，MetaAligner 从训练前向的**副产品**中提取 5 维健康信号：
+## 3. 关键创新点
 
-| 信号 | 计算来源 | 物理意义 | 响应策略 |
-|------|---------|---------|---------|
-| **Plateau** | `train_auc_history` 的滑动范围 | 模型是否陷入局部最优 | `aux_weight ↑` |
-| **Grad Fatigue** | `grad_norm_ctr` 早期/近期比值 | 优化器是否"用力但无效" | `aux_weight ↑` |
-| **Confidence Deficit** | `logits_std` 低于目标阈值 | 模型输出过于保守 | `energy_weight ↑` |
-| **Proto Chaos** | `assign_entropy` 占最大熵比例 | 原型分配模糊，缺乏结构 | `diff_weight ↑` |
-| **Diff Residual** | `MSE(pred_noise, noise)` | 表示空间去噪难度大 | `diff_weight ↑` |
+### 3.1 生成式语义原型 (DynamicPrototypeManifold)
 
-这些信号全部来自 **no_grad 前向传播**，不增加 backward 开销，但使 MetaAligner 能在**每个 step** 更新权重，而非等待 validation。
+传统序列编码直接输出固定向量，难以处理行为稀疏、意图漂移等问题。v10 引入**语义原型空间**：
 
-### 4.3 PID 控制（Valid-aware 模式）
+- **全局原型 `η`**: 可学习的 `num_codes × code_dim` 矩阵，构成语义字典。
+- **CayleyRotation**: 根据用户条件特征对原型进行保距旋转，实现个性化语义空间。
+- **LangevinSinkhorn**: 通过熵正则化最优传输（Sinkhorn）+ Langevin 噪声，将序列表征 `z_seq` 软分配到原型上，输出 `proto_weights`（分配概率）。
+- **κ 动态锐化**: 基于用户特征和时间跨度自适应调节分配锐度，避免退化的均匀分配。
 
-当 valid_auc 可用时，MetaAligner 切换为经典 PID：
+**自监督目标**：
+- **Packing Loss**: 最大化原型间余弦距离（避免坍缩）。
+- **正交正则**: Cayley 旋转矩阵的正交约束。
+- **κ 正则**: 防止锐度过高或过低。
 
-```
-error (gap) = train_auc - valid_auc          # 过拟合程度
-P = kp * gap                                  # 当前误差响应
-I = ki * ∫ gap dt                             # 历史误差累积（限幅 ±5）
-D = kd * (-d(gap)/dt)                         # 抑制震荡
-aux_weight = clamp(P + I + D, 0, 0.5)         # 辅助任务最多 50%
-```
+### 3.2 解耦优化 (Decoupled Optimization)
 
-**积分限幅的重要性**：防止 valid_auc 暂时波动导致积分饱和（windup），确保系统可恢复。
+为避免生成模块的复杂梯度干扰主 CTR 任务，v10 采用**架构级梯度隔离**：
+
+| 模块 | 梯度归属 | 说明 |
+|------|---------|------|
+| `shared_encoder` / `seq_encoder` / `cross_field` / `ctr_head` | **CTR 路径** | 主判别任务 |
+| `prototype` / `diffusion_explainer` / `energy_calibrator` | **生成模块 (gen_module)** | 自监督任务 |
+| `meta_aligner` | **Meta** | 辅助权重控制 |
+| `embedding` | **Sparse** | 高维稀疏特征，独立 Adagrad |
+
+**关键机制**：
+- 生成模块输出（`proto_repr`, `diff_explain`, `energy_score`）在进入 CTR 路径前均已 **detach()**。
+- 生成模块仅通过 `ib/recon/ortho/packing/energy_target` 等自监督损失训练。
+- **单次 `total_loss.backward()`**，通过 PyTorch 计算图自动实现梯度隔离，无需多步 backward。
+- `IsolatedOptimizer` 管理四组优化器，分别 step，实现参数更新隔离。
+
+### 3.3 扩散解释器 (DiffusionExplainer)
+
+作为生成模块的核心组件，DiffusionExplainer 学习 CTR 路径的**残差解释**：
+
+- **输入**: 序列表征 `z_seq`、原型分配 `proto_weights`、原型残差 `proto_res`、CTR 表征 `ctr_repr`、CTR logits。
+- **瓶颈编码**: 将高维交互信息压缩到 `bottleneck_dim`（默认 64），强制学习紧凑的残差模式。
+- **输出**: `diff_explain`（残差修正向量，维度 `d_model×4`）和 `uncertainty`（不确定性估计）。
+- **对齐约束**: 
+  - `align_loss`: diff_explain 在 CTR 表征方向上的投影（学习有效修正）。
+  - `diversity_bonus`: 正交于 CTR 表征的分量（鼓励探索新信息）。
+  - `residual_target_loss`: 在决策边界附近（p∈[0.3,0.7]）施加更大残差目标。
+
+### 3.4 能量校准器 (EnergyCalibrator)
+
+EnergyCalibrator 不直接参与训练，而是作为**预测质量评估器**：
+
+- **功能**: 根据 `proto_weights`、`user_feat`、`item_feat` 和 `|ctr_logits|` 预测当前样本的**预测误差能量**。
+- **训练目标**: MSE 拟合当前 batch 的 BCE 误差。
+- **CTR Head 应用**: 在推理时，高 energy 样本会降低 diff_explain 残差权重，实现**不确定性感知的保守预测**。
+
+### 3.5 过拟合感知的元对齐 (MetaAligner)
+
+MetaAligner 替代传统固定权重的多任务加权，实现动态辅助权重调度：
+
+- **残差收益驱动 (`residual_benefit`)**: 当 `loss_base - loss_final > 0`（生成模块帮助了 CTR），提升 `aux_weight`；反之则降低。
+- **过拟合硬上限**: 当 `train_AUC - valid_AUC > 0.03` 时，强制压缩 `aux_weight`。
+- **Valid-AUC 缺失保护**: 两次验证之间采用指数衰减插值，避免离线盲目探索。
+- **输出**: 仅 `aux_weight`（生成模块总权重），不干预内部各损失配比。
 
 ---
 
-## 五、序列建模 × 特征交互的协同机制
+## 4. 数据加载与防泄露 (Anti-Leak)
 
-### 5.1 信息流动全景
+### 4.1 统一 CVR 标签逻辑
 
-```
-用户行为序列 [seq_a, seq_b, ...]
-        ↓
-┌─────────────────────────────────────┐
-│ ContinuousSequenceEncoder            │
-│ ├─ SSMCell: 时间感知的连续状态演化   │
-│ └─ 多尺度池化: short / long / static │
-└─────────────────────────────────────┘
-        ↓
-   s_short (序列压缩表示)
-        ↓
-┌─────────────────────────────────────┐
-│ DynamicPrototypeManifold             │
-│ ├─ CayleyRotation: 用户条件化旋转    │
-│ ├─ vMF 匹配: 序列-原型相似度         │
-│ ├─ LangevinSinkhorn: 最优传输分配    │
-│ └─ 任务投影: ctr/diff/energy 分离    │
-└─────────────────────────────────────┘
-        ↓
-   proto_repr (用户兴趣的原子分解)
-        ↓
-┌─────────────────────────────────────┐
-│ CrossFieldNet                        │
-│ ├─ 四场输入: user/item/context/seq   │
-│ ├─ SeqFiLM: 序列调制其他场           │
-│ └─ 场间注意力: 信息交换与聚合          │
-└─────────────────────────────────────┘
-        ↓
-   final_repr (交互后的联合表示)
-        ↓
-┌─────────────────────────────────────┐
-│ GenerativeFusion (RS)                │
-│ ├─ DiffusionHead: 去噪鲁棒表示       │
-│ ├─ EnergyHead: 判别边界表示          │
-│ └─ 残差融合: proto + Δdiff + Δenergy │
-└─────────────────────────────────────┘
-        ↓
-   fused_repr → CTRHead → logit → sigmoid → PCVR
-```
+- **过滤**: 仅保留 `label_type > 0` 的点击样本（CVR 任务天然条件于点击）。
+- **标签**: `label = (label_type == 2)`，即点击且转化=1，点击未转化=0。
+- **训练/验证统一**: 训练和验证集采用完全一致的过滤逻辑，避免 valid_AUC=0 的陷阱。
 
-### 5.2 关键协同点
+### 4.2 防泄露模式 (`ANTI_LEAK_MODE`)
 
-**协同点 1：序列 → 原型（时间几何化）**
+| 模式 | 机制 | 适用场景 |
+|------|------|---------|
+| `timestamp` (默认) | 按时间戳排序 RowGroup，后 10% 作为验证 | 时序数据，严格因果 |
+| `user_id` | 按用户划分，不同用户不跨集 | 用户级独立同分布 |
+| `none` | 原始随机划分 | 快速实验 |
 
-SSMCell 将离散点击序列转化为**连续时间动力学**，其输出 `s_short` 不是"最近 K 个物品的嵌入平均"，而是"带有时间衰减核的卷积结果"。这使得：
-- 1 小时前的点击与 1 周前的点击**自动获得不同权重**（通过 `exp(-t/10s)` 和 `exp(-t/86400s)` 双衰减）
-- 时间间隔不均匀的数据无需填充或截断
+### 4.3 词汇表防泄露
 
-**协同点 2：原型 → 场域（原子组合）**
-
-`proto_repr` 是用户兴趣的**原子分解**（128 个原型的加权组合）。CrossFieldNet 不是直接用这个向量做预测，而是将其作为**场间交互的催化剂**：
-- `seq` 场携带 `proto_repr`
-- `user` 场携带用户画像
-- `item` 场携带物品属性
-- `context` 场携带上下文
-
-四者在 CrossFieldLayer 中通过注意力交换信息，实现**"序列-informed 的特征交互"**——不是"序列 + 特征"的拼接，而是"序列调制下的特征重组"。
-
-**协同点 3：场域 → 表示手术（不确定性消化）**
-
-CrossFieldNet 的输出是确定性的，但推荐系统需要**认知不确定性建模**（"这个用户我真的了解吗？"）。DiffusionHead 和 EnergyHead 提供两种不确定性消化机制：
-- **Diffusion**：通过去噪过程学习"表示空间的鲁棒邻域"——如果 proto_repr 附近的小扰动能被正确去噪，说明表示空间平滑
-- **Energy**：通过能量函数学习"判别边界的置信度"——能量差大的样本对更容易分类
-
-GenerativeFusion 不是简单加权三者，而是让 CTR head 学习**"何时信任原始表示、何时需要鲁棒修正、何时需要判别增强"**。
-
-**协同点 4：MetaAligner → 全系统（动态平衡）**
-
-MetaAligner 不是外部插件，而是**系统的"自主神经系统"**：
-- 检测训练健康度（过拟合/停滞/正常）
-- 调节辅助任务的介入强度
-- 确保主任务（CTR）始终获得 ≥50% 的注意力
-
-这使得系统能在**无人工调参**的情况下，自动适应不同数据阶段：早期快速收敛时专注 CTR，平台期时引入 diff/energy 打破僵局，过拟合时加强正则化。
+- 验证集自动限制 vocab 为训练集观测到的最大值（`train_vocab`），避免 unseen ID 泄露信息。
+- 序列截断：验证集序列仅保留 `timestamp <= split_timestamp` 的历史行为。
 
 ---
 
-## 六、设计原则总结
+## 5. 训练流程
 
-| 原则 | 具体体现 |
+```python
+# Phase 0: 清零梯度
+optimizer.zero_grad_shared()
+optimizer.zero_grad_gen()
+optimizer.zero_grad_meta()
+
+# Phase 1: CTR Forward
+out = model(input, task_id='ctr')
+(logits, proto_weights, proto_repr, kappa_mean, assign_entropy,
+ diff_explain, uncertainty, gen_align_loss, energy_score,
+ packing_loss, base_logits, final_repr) = out
+
+# Phase 2: CTR Loss
+loss_ctr = adaptive_focal(logits, labels)  # 或 BCE
+loss_ctr_base = bce(base_logits, labels)
+
+# Phase 3: Energy Target
+energy_target_loss = energy_calibrator.compute_target(energy_score, base_logits.detach(), labels)
+
+# Phase 4: Gen Loss (自监督)
+gen_loss = gen_align_loss + energy_target_loss * 0.1 + packing_loss * packing_weight
+
+# Phase 5: MetaAligner 调度
+residual_benefit = loss_ctr_base.item() - loss_ctr.item()
+meta = model.meta_aligner(valid_auc=..., train_auc=..., residual_benefit=...)
+aux_weight = meta['aux_weight']
+
+# Phase 6: 总 Loss
+total_loss = loss_ctr + aux_weight * gen_loss
+total_loss.backward()  # 单次 backward，梯度自动隔离
+
+# Phase 7: 参数更新
+optimizer.step_shared()  # CTR 路径
+if gen_loss > 0:
+    optimizer.step_gen()   # 生成模块
+optimizer.step_meta()      # MetaAligner
+```
+
+---
+
+## 6. 模块详解
+
+### 6.1 MultiViewEncoder
+- 用户/物品离散特征通过 `ConstrainedEmbedding`（L2 归一化约束）编码。
+- 稠密特征通过 `IntraLinear` 投影到 `d_model`。
+- 输出多任务视角：`shared`、`user`、`item`、`context`。
+
+### 6.2 ContinuousSequenceEncoder
+- 基于 **SSM (State Space Model)** 的序列编码器，替代传统 Transformer，线性复杂度。
+- `SSMCell`: 连续时间离散化状态空间，支持非均匀时间戳（`time_deltas`）。
+- 输出四路序列摘要：`short`（近期加权）、`long`（长期平均）、`static`（统计量）、`full_seq`。
+- 空序列处理：通过 `empty_mu + empty_sigma * noise` 生成随机空状态，避免全零退化。
+
+### 6.3 ProtoConditionedCrossFieldNet
+- 4 层交叉场网络，场定义：`['user', 'item', 'context', 'seq']`。
+- 每层包含：
+  1. **MHA**: 场间自注意力。
+  2. **Proto-bias**: `proto_weights` 温和注入（scale=0.05），避免主导。
+  3. **SeqFiLM**: 序列条件化特征调制。
+  4. **Diff-gate FFN**: `diff_explain` 通过门控调制 FFN 输出。
+
+### 6.4 CalibratedCTRHead
+- 三路融合：`static`（基础表征）、`proto`（原型语义）、`pos_boost`（原型激活增强）。
+- **Uncertainty-gated Residual**: `uncertainty` 高时降低 `diff_explain` 权重，防止噪声修正。
+- **温度缩放**: `logit_temperature` 自适应调节输出锐度。
+- **训练时偏置校正**: 若 logits 均值 <-3.0，自动提升偏置防止过度悲观。
+
+### 6.5 AdaptiveFocalLoss
+- `gamma` 为可学习参数（`gamma_logit`），通过独立 Adam 优化器更新。
+- 支持 `gamma_min`（默认 0.5）硬下限，防止早期过度聚焦。
+- 变化率限制：每次更新不超过 `±0.5`，防止震荡。
+- Warmup：前 `gamma_warmup_steps` 步线性升温。
+
+---
+
+## 7. 全链路 NaN 防护
+
+v10 在多个层级实施 NaN/Inf 检测与自动恢复：
+
+| 层级 | 机制 |
+|------|------|
+| **数据层** | `check_nan_tensor` 检测输入/输出异常 |
+| **模型层** | `DynamicPrototypeManifold._check_and_recover_nan()` 参数重初始化 |
+| **梯度层** | `IsolatedOptimizer.check_and_recover_nan_params()` 全局参数恢复 |
+| **损失层** | `total_loss` NaN 时替换为 0.0，跳过有害 batch |
+| **Logits** | 硬裁剪到 `[-20, 20]`，防止极端值 |
+| **SSM 状态** | `h_states`  clamp 到 `[-100, 100]`，指数项 clamp 到 `[-80, 80]` |
+
+---
+
+## 8. 快速开始
+
+### 8.1 环境要求
+
+```bash
+python >= 3.9
+pytorch >= 2.1
+pyarrow >= 12.0
+numpy, scikit-learn, tqdm
+```
+
+### 8.2 数据准备
+
+数据目录需包含：
+```
+data/
+  ├── *.parquet          # 训练数据（多文件）
+  └── schema.json        # 特征模式定义
+```
+
+`schema.json` 格式：
+```json
+{
+  "user_int": [[fid, vocab_size, dim], ...],
+  "item_int": [[fid, vocab_size, dim], ...],
+  "user_dense": [[fid, dim], ...],
+  "seq": {
+    "seq_a": {"prefix": "seq_a", "ts_fid": 100, "features": [[fid, vs], ...]},
+    ...
+  }
+}
+```
+
+### 8.3 启动训练
+
+```bash
+export TRAIN_DATA_PATH=/path/to/data
+export TRAIN_CKPT_PATH=/path/to/ckpt
+export TRAIN_LOG_PATH=/path/to/log
+export TRAIN_TF_EVENTS_PATH=/path/to/tf_events
+export ANTI_LEAK_MODE=timestamp  # 或 user_id / none
+
+bash run.sh
+```
+
+### 8.4 关键超参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--d_model` | 128 | 模型主维度 |
+| `--num_layers` | 4 | 交叉场层数 |
+| `--num_codes` | 128 | 原型数量 |
+| `--kappa_base` | 2.0 | 原型分配基础锐度 |
+| `--sinkhorn_epsilon` | 0.05 | 最优传输熵正则 |
+| `--packing_weight` | 0.01 | 原型打包损失权重 |
+| `--lr` | 1e-4 | 稠密参数学习率 |
+| `--sparse_lr` | 0.001 | 稀疏 Embedding 学习率 |
+| `--focal_alpha_pos` | 0.6 | Focal 正样本权重 |
+| `--focal_alpha_neg` | 0.4 | Focal 负样本权重 |
+| `--dropout_rate` | 0.2 | 全局 Dropout |
+| `--eval_every_n_steps` | 600 | 验证频率 |
+
+---
+
+## 9. 监控与诊断
+
+训练过程中通过 TensorBoard 记录以下指标：
+
+### 9.1 损失指标
+- `Loss/ctr`: 主 CTR 损失
+- `Loss/ctr_base`: 无残差基线损失
+- `Loss/gen`: 生成模块总损失
+- `Loss/gen_align`: 扩散解释对齐损失
+- `Loss/energy_target`: 能量校准目标损失
+- `Loss/packing`: 原型打包损失
+
+### 9.2 诊断指标
+- `Stream/logits_mean`, `Stream/logits_std`: Logits 分布监控
+- `Diagnostics/train_auc`: 训练集 AUC
+- `Diagnostics/grad_norm_ctr`: CTR 路径梯度范数
+- `Diagnostics/nan_recovery_count`: NaN 恢复次数
+
+### 9.3 原型指标
+- `Proto/kappa_mean`: 平均分配锐度
+- `Proto/assign_entropy`: 分配熵（越低越尖锐）
+
+### 9.4 Meta 指标
+- `Meta/aux_weight`: 当前辅助权重
+- `Meta/residual_benefit`: 残差收益
+- `Meta/gap`: 训练-验证 AUC 差距
+- `Meta/mode`: 调度模式（valid_pid / interpolated）
+
+### 9.5 生成指标
+- `Gen/uncertainty_mean`: 平均不确定性
+- `Gen/energy_mean`, `Gen/energy_std`: 能量分布
+
+---
+
+## 10. 文件结构
+
+```
+.
+├── train.py           # 训练入口，参数解析与流程编排
+├── trainer.py         # Trainer 核心：解耦优化、训练循环、评估
+├── model.py           # 模型定义：生成式语义层 + 交叉场网络 + 预测头
+├── dataset.py         # Parquet 数据加载：防泄露、统一 CVR 标签、动态缓冲池
+├── run.sh             # 启动脚本，含完整默认参数
+└── utils.py           # 工具函数（需自行提供：EarlyStopping, set_seed 等）
+```
+
+---
+
+## 11. 版本演进
+
+| 版本 | 核心改进 |
 |------|---------|
-| **时间即物理量** | SSMCell 将时间差作为离散化步长，而非位置索引 |
-| **交互即场动力学** | CrossFieldNet 用 FiLM 和注意力建模场间耦合，而非静态内积 |
-| **表示即流形嵌入** | DynamicPrototypeManifold 将用户兴趣嵌入到可学习的原型流形上 |
-| **不确定性即信号** | Diffusion/Energy head 将噪声和能量 landscape 转化为有用特征 |
-| **手术即最小侵入** | 残差融合保证 eval 一致性，不破坏主任务学习 |
-| **调度即自主感知** | MetaAligner 从训练副产品提取信号，无需外部验证 |
+| v9.x | Anti-Leak 数据加载、SSM 序列编码、动态缓冲池 |
+| v10.0 | 引入 DynamicPrototypeManifold + DiffusionExplainer + EnergyCalibrator |
+| v10.1 | 解耦优化架构（单次 backward + 架构 detach） |
+| v10.2 | MetaAligner 残差收益驱动、EnergyCalibrator 误差预测、全链路 NaN 防护 |
 
 ---
 
-*Version: v9.3-RSOU (Representation Surgery + Online Uncertainty)*
-*Last Updated: 2026-05-14*
+## 12. 引用与致谢
+
+本框架基于以下技术构建：
+- **State Space Models (SSM)**: 连续时间序列建模
+- **Optimal Transport (Sinkhorn)**: 熵正则化分配
+- **Information Bottleneck**: 瓶颈残差编码
+- **Cayley Transform**: 保距流形旋转
+
+---
+
+> **维护提示**: 若遇到 `valid_AUC` 随 epoch 下降但 `LogLoss` 也下降的情况，请检查 `MetaAligner` 的 `residual_benefit` 符号是否正常（应为正表示生成模块有帮助），并确认 `ANTI_LEAK_MODE` 设置是否符合数据时序特性。
