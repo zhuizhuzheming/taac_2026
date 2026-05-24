@@ -165,7 +165,7 @@ If you find this work useful, please consider citing our technical report:
 
 ## Acknowledgments
 
-This work was developed during the **2026 Tencent Ads Algorithm Competition**. We thank the organizers for providing the industrial-scale TencentGR dataset and the competition platform that enabled extensive diagnostic logging and mechanistic validation.
+This work was developed during the **2026 Tencent Ads Algorithm Competition**. We thank the organizers for providing the industrial-scale TencentGR dataset and the competition platform that enabled extensive diagnostic logging and mechanistic validation.We also thank Kimi K2.6 to help organize the models' implementation and the written report.
 
 ---
 
