@@ -2,13 +2,11 @@
 
 **Tightly Coupling Sequence Prototypes with Heterogeneous Feature Interaction for CTR Prediction**
 
-[![Paper](https://img.shields.io/badge/Paper-PDF-red)](./technical_report.pdf)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)]()
+2026TAAC-team_id: ICPC和AI谁强
 
 > **Note:** This repository is currently under preparation for public release. The full paper is available in [`technical_report.pdf`](./technical_report.pdf).
 
 ---
-
 ## Overview
 
 HeteroFormer is a unified architecture for Click-Through Rate (CTR) prediction that fundamentally rethinks how long-range user behavior sequences interact with heterogeneous non-sequential features. Rather than following the prevailing two-stage paradigm—where sequences are compressed into fixed-length vectors before being fused with dense features—HeteroFormer introduces a single principle:
