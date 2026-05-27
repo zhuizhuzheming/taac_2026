@@ -155,7 +155,8 @@ If you find this work useful, please consider citing our technical report:
 ```bibtex
 @article{xu2026heteroformer,
   title={HeteroFormer: Tightly Coupling Sequence Prototypes with Heterogeneous Feature Interaction for CTR Prediction},
-  author={Xu, Jiahao},
+  author={Xu Jiahao},
+  email={zhuizhuzheming@163.com}
   year={2026},
   journal={Tencent Ads Algorithm Competition Technical Report}
 }
