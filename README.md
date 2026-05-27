@@ -4,7 +4,7 @@
 
 2026TAAC-team_id: ICPC和AI谁强
 
-> **Note:** This repository is currently under preparation for public release. The full paper is available in [`technical_report.pdf`](./technical_report.pdf).
+> **Note:** This repository is currently under preparation for public release. The full paper is available in https://zenodo.org/records/20420273.
 
 ---
 ## Overview
