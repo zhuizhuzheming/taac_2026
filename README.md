@@ -36,7 +36,7 @@ This repository contains two implementations of the HeteroFormer architecture, r
 ├── PCVRHeteroFormer/            # Industrial-strength stable variant (Stability Ablation)
 │   └── ...                      # Production-ready components
 ├── technical_report.pdf         # Full technical report
-├── model_org.py                 # Originally design of HeteroFormer 
+├── model_org.py                 # Initial design of HeteroFormer 
 └── README.md                    # This file
 ```
 
