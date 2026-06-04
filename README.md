@@ -37,6 +37,7 @@ This repository contains two implementations of the HeteroFormer architecture, r
 │   └── ...                      # Production-ready components
 ├── technical_report.pdf         # Full technical report
 └── README.md                    # This file
+└── THOUGHTS.md                  # thoughts of KDD × Tencent Advertising Algorithm Competition 2026
 ```
 
 ### `HeteroFormer_model/` — Full Architecture
