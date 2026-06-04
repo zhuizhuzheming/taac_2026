@@ -2,7 +2,7 @@
 
 **Tightly Coupling Sequence Prototypes with Heterogeneous Feature Interaction for CTR Prediction**
 
-2026TAAC-team_id: ICPC和AI谁强
+2026TAAC-team_id: ICPC和AI谁强<br>
 This model is intended for KDD × Tencent Advertising Algorithm Competition(TAAC), to answer the question of how to mix Seq and non-seq model.
 We build the model, to explore which way is explainable and tightfully make use of the information the data gives.
 
