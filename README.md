@@ -11,7 +11,7 @@ If you find this work helpful for your research or engineering, please consider 
 ---
 ## Overview
 
-HeteroFormer is a unified architecture for Click-Through Rate (CTR) prediction that fundamentally rethinks how long-range user behavior sequences interact with heterogeneous non-sequential features. Rather than following the prevailing two-stage paradigm—where sequences are compressed into fixed-length vectors before being fused with dense features—HeteroFormer introduces a single principle:
+HeteroFormer is a unified architecture for Conversion Rate (CVR) prediction that fundamentally rethinks how long-range user behavior sequences interact with heterogeneous non-sequential features. Rather than following the prevailing two-stage paradigm—where sequences are compressed into fixed-length vectors before being fused with dense features—HeteroFormer introduces a single principle:
 
 > **Sequence-derived semantics should actively parameterize heterogeneous feature interactions, rather than being passively injected as compressed context.**
 
@@ -74,24 +74,24 @@ A surgically simplified variant engineered for deployment under single-GPU, mixe
 
 ### Why Not Standard Transformer?
 
-Standard self-attention is structurally mismatched to heterogeneous CTR features for three reasons:
+Standard self-attention is structurally mismatched to heterogeneous CVR features for three reasons:
 
 1. **Feature Heterogeneity Violates Token Homogeneity**: User IDs, item attributes, context features, and sequences live on different statistical manifolds. Standard attention assumes a shared Euclidean metric, inducing distorted similarity measures.
-2. **Permutation Invariance is a Liability**: In CTR, field order carries strong semantic meaning ("who → what → when"). A permutation-invariant mixer destroys this causal structure.
+2. **Permutation Invariance is a Liability**: In CVR, field order carries strong semantic meaning ("who → what → when"). A permutation-invariant mixer destroys this causal structure.
 3. **Quadratic Complexity is Prohibitive**: With thousands of tokens in industrial settings, O(M²d) attention is infeasible. HeteroFormer treats each field as a single token (M=4), reducing attention to O(16d).
 
 ### Core Design
 
 The architecture consists of four tightly integrated stages:
 
-1. **Multi-View Encoding**: User, item, and dense features are encoded into shared semantic representations with task-specific views (CTR, diffusion, energy).
+1. **Multi-View Encoding**: User, item, and dense features are encoded into shared semantic representations with task-specific views (CVR, diffusion, energy).
 2. **Continuous Sequence Modeling**: Variable-length behavior sequences are processed by sequence encoders, producing multi-scale summaries (short-term, long-term, static).
 3. **Dynamic Prototype Manifold**: The fused sequence representation is mapped onto a user-conditioned prototype manifold, yielding sparse prototype assignments π ∈ Δ^(K−1) and a compact prototype representation.
 4. **Proto-Conditioned Interaction & Prediction**: Prototype assignments bias cross-field attention and gate feed-forward transformations; a calibrated prediction head fuses static, prototype, and residual signals.
 
 ### Decoupled Semantic Optimization (DSO)
 
-Training HeteroFormer requires balancing three competing objectives: CTR classification, generative semantic losses, and geometric regularization. DSO achieves stable co-training through:
+Training HeteroFormer requires balancing three competing objectives: CVR classification, generative semantic losses, and geometric regularization. DSO achieves stable co-training through:
 
 - **Gradient Isolation**: Architectural detachment ensures generative gradients do not backpropagate through the CTR head, and vice versa.
 - **MetaAligner**: An overfitting-aware controller that dynamically modulates the auxiliary coupling weight λ_aux based on residual benefit and train-validation AUC gap.
@@ -157,7 +157,7 @@ If you find this work useful, please consider citing our technical report:
 
 ```bibtex
 @article{xu2026heteroformer,
-  title={HeteroFormer: Tightly Coupling Sequence Prototypes with Heterogeneous Feature Interaction for CTR Prediction},
+  title={HeteroFormer: Prototype-Driven Unified Recommendation with Decoupled Semantic Optimization},
   author={Xu Jiahao},
   email={zhuizhuzheming@163.com}
   year={2026},
