@@ -1,6 +1,6 @@
 # HeteroFormer
 
-**Tightly Coupling Sequence Prototypes with Heterogeneous Feature Interaction for CTR Prediction**
+**Prototype-Driven Unified Recommendation with Decoupled Semantic Optimization**
 
 2026TAAC-team_id: ICPC和AI谁强<br>
 This model is intended for KDD × Tencent Advertising Algorithm Competition(TAAC), to answer the question of how to mix Seq and non-seq model.
