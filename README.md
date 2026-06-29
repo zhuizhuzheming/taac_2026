@@ -6,7 +6,7 @@
 This model is intended for KDD × Tencent Advertising Algorithm Competition(TAAC), to answer the question of how to mix Seq and non-seq model.
 We build the model, to explore which way is explainable and tightfully make use of the information the data gives.
 
-> **Note:** This repository is currently under preparation for public release. The full paper is available in https://zenodo.org/records/20420273.
+> **Note:** This repository is currently under preparation for public release. The full paper is available in https://zenodo.org/records/21020476.
 If you find this work helpful for your research or engineering, please consider giving it a ⭐. It motivates me a lot!
 ---
 ## Overview
