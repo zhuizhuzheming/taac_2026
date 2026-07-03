@@ -6,8 +6,8 @@
 This model is intended for KDD × Tencent Advertising Algorithm Competition(TAAC), to answer the question of how to mix Seq and non-seq model.
 We build the model, to explore which way is explainable and tightfully make use of the information the data gives.
 
-> **Note:** This repository is currently under preparation for public release. The full paper is available in https://zenodo.org/records/21020476.
-If you find this work helpful for your research or engineering, please consider giving it a ⭐. It motivates me a lot!
+> **Note:** This repository is currently under preparation for public release. The full paper is available in https://zenodo.org/records/21168893.
+If you find this work helpful for your research or engineering, please consider giving it a ⭐. It motivates me a lot! You can also issue if any problem about the hub.
 ---
 ## Overview
 
@@ -157,7 +157,7 @@ If you find this work useful, please consider citing our technical report:
 
 ```bibtex
 @article{xu2026heteroformer,
-  title={HeteroFormer: Prototype-Driven Unified Recommendation with Decoupled Semantic Optimization},
+  title={HeteroFormer: A Mechanistic Study of Prototype-Driven Unified Recommendation under Resource Constraints},
   author={Xu Jiahao},
   email={zhuizhuzheming@163.com}
   year={2026},
